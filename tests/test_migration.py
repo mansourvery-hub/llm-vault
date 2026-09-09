@@ -56,6 +56,16 @@ class MigrationTest(unittest.TestCase):
         for k, v in w.DEFAULT_SETTINGS.items():
             self.assertEqual(db[w.SETTINGS_KEY][k], v)
 
+    def test_project_id_preserved_and_defaulted(self):
+        # additive: existing project_id survives migration, new creds get ""
+        db = w.migrate_db({"gemini": {"keys": ["K1", "K2"],
+                                      "credentials": [
+                                          {"id": "cred-x", "secret": "K1",
+                                           "project_id": "proj-a"}]}})
+        creds = {c["secret"]: c for c in db["gemini"]["credentials"]}
+        self.assertEqual(creds["K1"].get("project_id"), "proj-a")
+        self.assertEqual(creds["K2"].get("project_id"), "")
+
     def test_save_load_roundtrip(self):
         db = w.migrate_db(copy.deepcopy(LEGACY_DB))
         w.save_db(db)

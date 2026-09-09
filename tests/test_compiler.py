@@ -108,6 +108,32 @@ class CompilerTest(unittest.TestCase):
         from litellm.types.router import RetryPolicy
         self.assertEqual(set(rp), set(RetryPolicy.model_fields))
 
+    def test_allowed_fails_policy_emitted_and_supported(self):
+        w.generate_yaml(base_db())
+        cfg = read_yaml(w.YAML_FILE)
+        afp = cfg["router_settings"]["allowed_fails_policy"]
+        # 429 cools immediately; transient errors get one failure first
+        self.assertEqual(afp["RateLimitErrorAllowedFails"], 0)
+        self.assertEqual(afp["TimeoutErrorAllowedFails"], 1)
+        self.assertEqual(afp["InternalServerErrorAllowedFails"], 1)
+        # only keys supported by installed LiteLLM's AllowedFailsPolicy
+        from litellm.types.router import AllowedFailsPolicy
+        self.assertLessEqual(set(afp), set(AllowedFailsPolicy.model_fields))
+        # and it must be a valid Router init arg
+        from litellm import Router
+        self.assertIn("allowed_fails_policy", Router.get_valid_args())
+
+    def test_per_deployment_cooldown_emitted(self):
+        w.generate_yaml(base_db())
+        cfg = read_yaml(w.YAML_FILE)
+        for item in cfg["model_list"]:
+            lp = item["litellm_params"]
+            # gemini (429-prone) waits the full rate-limit pause
+            if lp["model"].startswith("gemini/"):
+                self.assertEqual(lp["cooldown_time"], 60.0)
+            else:
+                self.assertEqual(lp["cooldown_time"], 30.0)
+
     def test_master_key_env_backed(self):
         w.generate_yaml(base_db())
         cfg = read_yaml(w.YAML_FILE)
@@ -151,6 +177,52 @@ class CompilerTest(unittest.TestCase):
         diff = w.deployment_diff(old, new)
         self.assertEqual(diff["added"], 1)
         self.assertEqual(diff["removed"], 0)
+
+
+class EndpointResolutionTest(unittest.TestCase):
+    def test_precedence(self):
+        db = w.migrate_db({
+            "zai": {"keys": ["Z"], "models": ["glm-4.7-flash"],
+                    "endpoints": ["https://api.z.ai/api/v1"]},
+        })
+        # stored endpoints[0] wins over everything
+        self.assertEqual(w.effective_base_url(db, "zai"),
+                         "https://api.z.ai/api/v1")
+        self.assertEqual(w.effective_base_url(db, "zai", "https://x.example/v9/"),
+                         "https://x.example/v9")
+        db["zai"]["endpoints"] = []
+        db["zai"]["base_url"] = "https://stored.example/v1"
+        self.assertEqual(w.effective_base_url(db, "zai"),
+                         "https://stored.example/v1")
+        del db["zai"]["base_url"]
+        # builtin default, trailing slashes trimmed
+        self.assertEqual(w.effective_base_url(db, "zai"),
+                         "https://api.z.ai/api/paas/v4")
+        # stateless callers still get the builtin
+        self.assertEqual(w.effective_base_url(None, "zai"),
+                         "https://api.z.ai/api/paas/v4")
+        # nothing known -> None (true-custom before URL entry)
+        self.assertIsNone(w.effective_base_url({}, "custom"))
+        self.assertIsNone(w.effective_base_url(None, "custom"))
+
+    def test_yaml_uses_stored_override(self):
+        db = w.migrate_db({
+            "zai": {"keys": ["Z"], "models": ["glm-4.7-flash"],
+                    "endpoints": ["https://api.z.ai/api/v1"]},
+        })
+        w.generate_yaml(db)
+        cfg = read_yaml(w.YAML_FILE)
+        bases = {e["litellm_params"]["api_base"] for e in cfg["model_list"]}
+        self.assertEqual(bases, {"https://api.z.ai/api/v1"})
+
+    def test_yaml_falls_back_to_builtin(self):
+        db = w.migrate_db({
+            "zai": {"keys": ["Z"], "models": ["glm-4.7-flash"], "endpoints": []},
+        })
+        w.generate_yaml(db)
+        cfg = read_yaml(w.YAML_FILE)
+        bases = {e["litellm_params"]["api_base"] for e in cfg["model_list"]}
+        self.assertEqual(bases, {"https://api.z.ai/api/paas/v4"})
 
 
 if __name__ == "__main__":

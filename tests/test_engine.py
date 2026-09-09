@@ -256,5 +256,70 @@ class GatewayProbeTest(unittest.TestCase):
         self.assertFalse(engine.set_credential_quarantined(db, "gemini", "cred-nope"))
 
 
+class HealthRefreshTest(unittest.TestCase):
+    def test_probe_all_records_and_counts(self):
+        import contextlib
+        import io
+
+        import wizard as w
+        p, _ = tmp_paths()
+        db = engine.load_state(p)
+        engine.add_credentials(db, "gemini", ["K1-FAKE", "K2-FAKE"])
+        engine.set_models(db, "gemini", ["gemini-3.7-flash"])
+        engine.add_credentials(db, "openrouter", ["OR-FAKE"])
+        engine.set_models(db, "openrouter", ["paid-b"])
+        seen, progress = [], []
+        real = w.probe_model_classified
+
+        def fake(pid, model, key, endpoint=None):
+            seen.append((pid, model))
+            return ("OK", "fine") if pid == "gemini" else ("AUTH_ERROR", "bad")
+
+        w.probe_model_classified = fake
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                counts = engine.refresh_credential_health(
+                    db, sleep_s=0,
+                    progress=lambda *a: progress.append(a))
+        finally:
+            w.probe_model_classified = real
+        self.assertEqual(counts, {"checked": 3, "ok": 2, "throttled": 0,
+                                  "invalid": 1, "unknown": 0})
+        self.assertEqual(len(seen), 3)  # one probe per credential, not per deployment
+        self.assertEqual(len(progress), 3)
+        for c in db["gemini"]["credentials"]:
+            self.assertEqual((c.get("validation") or {}).get("status"), "ok")
+        orch = db["openrouter"]["credentials"][0]
+        self.assertEqual((orch.get("validation") or {}).get("status"), "invalid")
+
+    def test_stop_and_skips(self):
+        import contextlib
+        import io
+        import threading
+
+        import wizard as w
+        p, _ = tmp_paths()
+        db = engine.load_state(p)
+        engine.add_credentials(db, "gemini", ["K1-FAKE"])
+        engine.set_models(db, "gemini", ["m"])
+        stop = threading.Event()
+        stop.set()
+        with contextlib.redirect_stdout(io.StringIO()):
+            counts = engine.refresh_credential_health(db, sleep_s=0, stop=stop)
+        self.assertEqual(counts["checked"], 0)
+        # quarantined credentials are skipped, not probed
+        engine.set_credential_quarantined(db, "gemini",
+                                          db["gemini"]["credentials"][0]["id"], True)
+        real = w.probe_model_classified
+        w.probe_model_classified = lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("must not probe"))
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                counts = engine.refresh_credential_health(db, sleep_s=0)
+        finally:
+            w.probe_model_classified = real
+        self.assertEqual(counts["checked"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

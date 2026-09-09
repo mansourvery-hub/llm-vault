@@ -6,7 +6,7 @@ credentials + model capabilities + quota domains + routing policy into
 LiteLLM YAML. LiteLLM remains the runtime router; this wizard is the
 control plane / configuration compiler.
 """
-__version__ = "2.3.0"
+__version__ = "2.4.0"
 SCHEMA_VERSION = 2
 import datetime
 import hashlib
@@ -64,6 +64,19 @@ RETRY_POLICY = {
 ROUTER_NUM_RETRIES = 1
 ROUTER_COOLDOWN_TIME = 60
 ROUTER_ALLOWED_FAILS = 1
+# M2 routing/cooldowns: a 429 cools the deployment immediately (the
+# next project's deployment in the same pool takes over); transient
+# timeouts/5xx get ONE failure before cooling down (shorter penalty).
+ALLOWED_FAILS_POLICY = {
+    "RateLimitErrorAllowedFails": 0,
+    "TimeoutErrorAllowedFails": 1,
+    "InternalServerErrorAllowedFails": 1,
+    "ServiceUnavailableErrorAllowedFails": 1,
+    "BadGatewayErrorAllowedFails": 1,
+}
+COOLDOWN_RATE_LIMIT_S = 60.0   # 429: quota bucket needs a real pause
+COOLDOWN_TRANSIENT_S = 30.0    # timeouts/5xx: likely temporary
+PROVIDER_COOLDOWN_S = {"gemini": COOLDOWN_RATE_LIMIT_S}
 
 PROVIDERS = {
     "1": {"id": "gemini", "name": "Google Gemini (AI Studio)", "prefix": "gemini/", "type": "api"},
@@ -334,7 +347,7 @@ def normalize_credentials(pdata):
         c = by_secret.get(k)
         if c is None:
             c = {"id": credential_id(k), "secret": k, "label": "",
-                 "quota_domain": "", "enabled": True,
+                 "quota_domain": "", "enabled": True, "project_id": "",
                  "validation": {"status": "unknown", "checked_at": "",
                                 "message": ""}}
         else:
@@ -344,6 +357,7 @@ def normalize_credentials(pdata):
             c.setdefault("enabled", True)
             c.setdefault("quota_domain", "")
             c.setdefault("label", "")
+            c.setdefault("project_id", "")
             c.setdefault("validation", {"status": "unknown", "checked_at": "",
                                         "message": ""})
         # dedup by secret; keep first
@@ -375,8 +389,31 @@ def iter_credentials(pdata, enabled_only=False):
 
 
 def default_quota_domain_id(pid, cred):
-    """Automatic default: one credential = one quota domain (secret-free)."""
+    """Automatic default: one credential = one quota domain (secret-free).
+
+    If the credential has a project_id (e.g., Google project), group by
+    project instead — keys from one project share one speed limit.
+    """
+    proj = cred.get("project_id") or ""
+    if proj:
+        return f"project:{pid}:{proj}"
     return f"credential:{cred.get('id', 'unknown')}"
+
+
+def effective_quota_domain(pid, cred):
+    """The domain a credential REALLY belongs to right now.
+
+    An explicit named domain wins — unless it is an automatic
+    per-credential default that went stale after a project_id was set
+    (the project grouping is more truthful than the old default).
+    """
+    qd = (cred.get("quota_domain") or "") if isinstance(cred, dict) else ""
+    if qd and not qd.startswith("credential:"):
+        return qd
+    proj = (cred.get("project_id") or "") if isinstance(cred, dict) else ""
+    if proj:
+        return f"project:{pid}:{proj}"
+    return qd or default_quota_domain_id(pid, cred)
 
 
 # ---------- database migration ----------
@@ -601,8 +638,9 @@ def estimate_capacity(db, members):
                 # per-domain, so every backing domain counts (never keys x RPM,
                 # never just the first credential's domain).
                 for c in iter_credentials(pdata):
-                    if c.get("quota_domain"):
-                        domains.add(c.get("quota_domain"))
+                    qd = effective_quota_domain(pid, c)
+                    if qd:
+                        domains.add(qd)
     rpm_known, tpm_known, unknown = 0, 0, 0
     for qd in domains:
         q = (db.get(QUOTA_KEY) or {}).get(qd) or {}
@@ -621,7 +659,7 @@ def resolve_deployment_limits(db, pid, cred, model):
     """Limit precedence: deployment override > quota-domain > provider known
     default > conservative default > unknown (None)."""
     dep_over = (cred.get("limits") or {}) if isinstance(cred, dict) else {}
-    qd = (cred.get("quota_domain") or "") if isinstance(cred, dict) else ""
+    qd = effective_quota_domain(pid, cred)
     q = (db.get(QUOTA_KEY) or {}).get(qd) or {}
     meta = PROVIDER_META.get(pid) or PROVIDER_META.get("custom")
     if pid.startswith("custom_"):
@@ -678,13 +716,69 @@ def classify_model_tier(model_id):
     return "unknown"
 
 
+# Provider families for context-window lookup (installed litellm map keys
+# are family-prefixed: "gemini/...", "openai/...", ...).
+_CTX_FAMILIES = {
+    "gemini": ("gemini/",),
+    "openrouter": ("openrouter/",),
+    "anthropic": ("anthropic/",),
+    "openai": ("openai/",),
+    "zai": ("z-ai/",),
+    "ollama_cloud": ("ollama/",),
+    "ollama_local": ("ollama/",),
+    "tokenrouter": ("openai/", "gemini/", "anthropic/"),
+    "opencode_zen": ("openai/", "gemini/", "anthropic/"),
+    "custom": ("openai/", "gemini/", "anthropic/"),
+}
+
+
+def lookup_context_window(pid, model_id):
+    """Context window (input tokens) from the installed litellm model map.
+
+    Exact id-string matches only — same model id, optionally with the
+    provider family prefix (``gemini/flash`` for ``flash``). Never fuzzy,
+    never guessed: returns an int or None. litellm stays a lazy optional
+    import so wizard.py remains stdlib + PyYAML.
+    """
+    up = str(model_id or "").strip()
+    if not up:
+        return None
+    try:
+        from litellm import model_cost as _mc
+    except Exception:  # noqa: BLE001 -- no litellm installed means unknown ctx
+        return None
+    core = up.split("/")[-1]
+    stems = []
+    for stem in (core, core.removesuffix(":free"), up, up.removesuffix(":free")):
+        if stem and stem not in stems:
+            stems.append(stem)
+    cands: list[str] = []
+    for stem in stems:
+        cands.append(stem)
+        for fam in _CTX_FAMILIES.get(pid, ("openai/", "gemini/", "anthropic/")):
+            cands.append(fam + stem)
+    if pid == "openrouter" and "/" in up:  # openrouter/<provider>/<model> keys
+        cands.append("openrouter/" + up)
+        cands.append("openrouter/" + up.removesuffix(":free"))
+    for key in cands:
+        entry = _mc.get(key)
+        if isinstance(entry, dict):
+            n = entry.get("max_input_tokens")
+            if isinstance(n, bool):
+                continue
+            if isinstance(n, (int, float)) and n > 0:
+                return int(n)
+    return None
+
+
 def infer_capabilities(pid, model_id):
     """Capability metadata. Unknown unless verified — never fabricate."""
     s = (model_id or "").lower()
     tier = classify_model_tier(model_id)
     caps: dict = {"tier": tier, "tools": "unknown", "streaming": "unknown",
                   "vision": "unknown", "reasoning": "unknown",
-                  "context_window": "unknown", "structured_output": "unknown"}
+                  "context_window": lookup_context_window(pid, model_id) or "unknown",
+                  "structured_output": "unknown"}
     if tier == "reasoning":
         caps["reasoning"] = True
     if pid in ("anthropic", "openai"):
@@ -803,6 +897,43 @@ def _provider_info(db, pid):
     return None
 
 
+# Builtin OpenAI-compatible bases (first-run defaults, derived from
+# PROVIDERS so they cannot drift; a stored override always wins via
+# effective_base_url).
+_BUILTIN_BASES = {p["id"]: p["base_url"] for p in PROVIDERS.values()
+                  if p.get("base_url")}
+
+
+def effective_base_url(db, pid, endpoint=None):
+    """Single source of truth for custom_api base URLs.
+
+    Precedence: explicit ``endpoint`` arg > stored ``endpoints[0]`` >
+    stored ``base_url`` > builtin default. Returns None when nothing is
+    known (true-custom providers before their URL is entered). ``db`` may
+    be None (stateless callers fall back to the builtin).
+    """
+    if endpoint:
+        return str(endpoint).rstrip("/")
+    pdata = {}
+    if isinstance(db, dict):
+        entry = db.get(pid)
+        if isinstance(entry, dict):
+            pdata = entry
+    stored = (pdata.get("endpoints") or [None])[0] or pdata.get("base_url")
+    if stored:
+        return str(stored).rstrip("/")
+    if pid in _BUILTIN_BASES:
+        return _BUILTIN_BASES[pid]
+    info = None
+    try:
+        info = _provider_info(db if isinstance(db, dict) else {}, pid)
+    except Exception:  # noqa: BLE001 -- provider lookup must never fail resolution
+        info = None
+    if isinstance(info, dict) and info.get("base_url"):
+        return str(info["base_url"]).rstrip("/")
+    return None
+
+
 def _litellm_model_for_provider(pid, model_id, ptype):
     if ptype in ("local_ollama", "remote_ollama"):
         return f"ollama/{model_id}"
@@ -891,7 +1022,7 @@ def build_deployments(db):
                 secret = cred.get("secret")
                 if not secret and ptype not in ("local_ollama",):
                     continue  # missing credential where required -> excluded
-                qd = cred.get("quota_domain") or default_quota_domain_id(pid, cred)
+                qd = effective_quota_domain(pid, cred)
                 eps = endpoints or ([base_url] if base_url else [None])
                 for ep in eps:
                     key = (pool, pid, cred.get("id"), str(ep), model_id)
@@ -1050,7 +1181,7 @@ def generate_yaml(db_data, _prev_deployments=None):
             if d.get("secret"):
                 params["api_key"] = d["secret"]
         elif ptype == "custom_api":
-            base_url = (db_data.get(pid, {}) or {}).get("base_url") or p_info.get("base_url")
+            base_url = effective_base_url(db_data, pid)
             if not base_url:
                 continue
             params["api_base"] = base_url
@@ -1067,6 +1198,9 @@ def generate_yaml(db_data, _prev_deployments=None):
             params["rpm"] = int(d["rpm"])
         if isinstance(d.get("tpm"), (int, float)) and d["tpm"] > 0:
             params["tpm"] = int(d["tpm"])
+        # per-deployment cooldown (verified: LiteLLM reads cooldown_time
+        # from litellm_params/model_info; 429-prone providers pause longer)
+        params["cooldown_time"] = PROVIDER_COOLDOWN_S.get(pid, COOLDOWN_TRANSIENT_S)
         if _needs_drop_params(pid, upstream):
             params["drop_params"] = True
         model_list.append({"model_name": pool, "litellm_params": params})
@@ -1100,6 +1234,7 @@ def generate_yaml(db_data, _prev_deployments=None):
             "num_retries": ROUTER_NUM_RETRIES,
             "cooldown_time": ROUTER_COOLDOWN_TIME,
             "allowed_fails": ROUTER_ALLOWED_FAILS,
+            "allowed_fails_policy": dict(ALLOWED_FAILS_POLICY),
             "enable_pre_call_checks": True,
             "retry_policy": dict(RETRY_POLICY),
         },
@@ -1312,8 +1447,9 @@ def _tokenrouter_key(key):
     return False, f"HTTP {s}: {raw[:150]}", None, None
 
 
-def _zai_key(key):
-    s, d, raw = _get("https://api.z.ai/api/paas/v4/models",
+def _zai_key(key, base=None):
+    base = (base or _BUILTIN_BASES["zai"]).rstrip("/")
+    s, d, raw = _get(f"{base}/models",
                      {"Authorization": f"Bearer {key}"})
     if s == 200 and d and "data" in d:
         return True, f"OK ({len(d['data'])} models)", [m.get("id") for m in d["data"]]
@@ -1406,8 +1542,9 @@ def validate_keys(pid, keys, endpoints):
             print(f"      [{'OK' if ok else 'FAIL'}] {snippet(k)} -> {msg}")
             results.append((k, ok, msg))
     elif pid == "zai":
+        base = effective_base_url(None, pid, (endpoints or [None])[0])
         for k in keys:
-            ok, msg, ids = _zai_key(k)
+            ok, msg, ids = _zai_key(k, base)
             if ids and avail is None:
                 avail = ids
             print(f"      [{'OK' if ok else 'FAIL'}] {snippet(k)} -> {msg}")
@@ -1475,7 +1612,8 @@ def fetch_catalog(pid, key, endpoint=None):
                 return None
             return sorted([(m["id"], m["id"]) for m in d["data"] if m.get("id")])
         if pid == "opencode_zen":
-            s, d, _ = _get("https://opencode.ai/zen/v1/models",
+            base = (endpoint or _BUILTIN_BASES["opencode_zen"]).rstrip("/")
+            s, d, _ = _get(f"{base}/models",
                            {"Authorization": f"Bearer {key}"})
             if s != 200 or not d or "data" not in d:
                 return None
@@ -1494,7 +1632,8 @@ def fetch_catalog(pid, key, endpoint=None):
             ok, _, items = _oai_compat_models(endpoint, key)
             return items if ok else None
         if pid == "zai":
-            s, d, _ = _get("https://api.z.ai/api/paas/v4/models",
+            base = (endpoint or _BUILTIN_BASES["zai"]).rstrip("/")
+            s, d, _ = _get(f"{base}/models",
                            {"Authorization": f"Bearer {key}"})
             if s != 200 or not d or "data" not in d:
                 return None
@@ -1708,8 +1847,7 @@ def test_single_model(pid, model, key, endpoint=None):
                 mid = model  # keep full ID from catalog
                 to = 60
             else:
-                bases = [{"opencode_zen": "https://opencode.ai/zen/v1",
-                          "zai": "https://api.z.ai/api/paas/v4"}[pid]]
+                bases = [endpoint or _BUILTIN_BASES[pid]]
                 mid = model.split("/")[-1]  # bare ID
                 to = 30
             bare = mid
@@ -2596,7 +2734,7 @@ def needs_quota_hint(db, pid):
     creds = list(iter_credentials(pdata))
     if len(creds) < 2:
         return False
-    return all((c.get("quota_domain") or "").startswith("credential:") for c in creds)
+    return all(effective_quota_domain(pid, c).startswith("credential:") for c in creds)
 
 
 def _quota_hint_line(pid):
@@ -2642,6 +2780,35 @@ def print_status(db, verbose=False):
     _print_alias_summary(db)
     _print_roles_summary(db)
     _print_diversity_hint(db)
+
+
+def quota_domains_list(db):
+    """Structured quota-domain facts for the TUI dashboard (no secrets).
+
+    One entry per domain per provider: domain id, key count, RPM when
+    set, Google project id when known, and the credential ids (masked
+    counts only — the raw ids are safe, the secrets never leave the DB).
+    """
+    domains = []
+    for pid, pdata in db.items():
+        if pid.startswith("_") or not isinstance(pdata, dict):
+            continue
+        buckets = {}
+        for c in iter_credentials(pdata):
+            qd = effective_quota_domain(pid, c)
+            buckets.setdefault(qd, []).append(c)
+        for qd, creds in sorted(buckets.items()):
+            qmeta = (db.get(QUOTA_KEY) or {}).get(qd) or {}
+            domains.append({
+                "domain_id": qd,
+                "provider": pid,
+                "key_count": len(creds),
+                "rpm": qmeta.get("rpm"),
+                "confidence": qmeta.get("confidence", ""),
+                "project_id": creds[0].get("project_id", "") if creds else "",
+                "keys": [c.get("id", "?") for c in creds[:5]],
+            })
+    return domains
 
 
 def _print_provider_domains(db, pid):
@@ -3289,10 +3456,12 @@ def manage_quota(db):
             if not allc:
                 print("  (no credentials yet)")
                 continue
-            for i, (pid, c) in enumerate(allc, 1):
+            for i, (cpid, c) in enumerate(allc, 1):
                 qd = c.get("quota_domain", "")
-                where = "separate (default)" if qd.startswith("credential:") else qd
-                print(f"    [{i:2d}] {pid:<18} key {_mask_secret(c.get('secret')):<10} in: {where}")
+                where = qd if qd and not qd.startswith("credential:") else "separate (default)"
+                proj = c.get("project_id") or ""
+                proj_str = f" [{proj}]" if proj else ""
+                print(f"    [{i:2d}] {cpid:<18} key {_mask_secret(c.get('secret')):<10}{proj_str} in: {where}")
             try:
                 raw = input("  Key numbers (empty cancels): ").strip()
                 named = sorted({c.get("quota_domain", "") for _, c in allc
@@ -3308,7 +3477,12 @@ def manage_quota(db):
             ensure_quota_domain(db, target, source="user")
             for tok in raw.replace(",", " ").split():
                 if tok.isdigit() and 1 <= int(tok) <= len(allc):
-                    allc[int(tok) - 1][1]["quota_domain"] = target
+                    cred = allc[int(tok) - 1][1]
+                    cred["quota_domain"] = target
+                    # project:pid:<id> buckets carry the project identity
+                    parts = target.split(":")
+                    if len(parts) >= 3 and parts[0] == "project":
+                        cred["project_id"] = parts[2]
             save_db(db)
             print(f"  [+] Moved into '{target}'. Shared speed is split fairly when saving.")
             continue
@@ -3364,13 +3538,30 @@ def quota_grouping_prompt(db, pid, candidate_keys):
         elif ans == "m":
             print("  [i] No problem — type 'quota' later to sort them out.")
         else:
-            print("  [i] OK — each key counts separately. If that's wrong, fix it with 'quota'.")
+            # different projects: each key can carry its own project id
+            print("  [i] OK — each key counts separately.")
+            for c in creds:
+                try:
+                    proj = input(f"  Project ID for key {_mask_secret(c.get('secret'))} "
+                                 "(empty = leave separate): ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    proj = ""
+                if proj:
+                    qd = f"project:{pid}:{proj}"
+                    c["project_id"] = proj
+                    c["quota_domain"] = qd
+                    ensure_quota_domain(db, qd, provider=pid, source="per-key project")
         if pid in db:
             # persist assignments onto the real entry
             by_secret = {str(c.get("secret")): c.get("quota_domain") for c in creds}
+            proj_secret = {str(c.get("secret")): c.get("project_id") for c in creds
+                           if c.get("project_id")}
             for c in db[pid].get("credentials", []) or []:
                 if str(c.get("secret")) in by_secret and by_secret[str(c.get("secret"))]:
                     c["quota_domain"] = by_secret[str(c.get("secret"))]
+                if str(c.get("secret")) in proj_secret:
+                    c["project_id"] = proj_secret[str(c.get("secret"))]
             # the question was answered: never nag about this provider again
             if isinstance(db[pid], dict):
                 db[pid]["quota_reviewed"] = True

@@ -132,13 +132,20 @@ llm-proxy-wizard
 ```
 
 Home is a table: one row per deployment with pool, provider, model, tier,
-rate limit (RPM), quota domain, context, health, and key suffix. A detail
-card below always describes the highlighted row; anything needing attention
-is listed underneath. **Configure** walks you through one provider at a
+quota (shared quota reads like `10÷3 RPM`, plus the domain), status, and
+key suffix. The header always shows how many models are working
+(`3/21 models working · 97 untested`) — status fills itself in on launch
+via one background probe per credential, and `P` re-probes on demand.
+Context windows (from the installed LiteLLM model map, exact ids only)
+and full quota/last-check details live in the row view. Providers and
+tiers are color-coded. Anything needing attention is listed underneath.
+**Configure** walks you through one provider at a
 time: paste keys → they are checked in the background → answer at most one
 question (do your keys share one usage limit?) → pick models from the live
 list (free first, type to filter) → each pick is probe-tested → **Review**
-shows what Apply will do. Same-model pools across providers are grouped
+shows what Apply will do. For OpenAI-compatible endpoints the base URL is
+pre-filled (stored override, else the builtin default) — edit it only if
+yours differs. Same-model pools across providers are grouped
 automatically; uncertain ones are offered for one-confirm grouping.
 **Test** checks every model through the gateway and helps park wrong-key
 connections. **OpenCode view** shows exactly what OpenCode sees: every
@@ -146,8 +153,11 @@ connections. **OpenCode view** shows exactly what OpenCode sees: every
 **Apply** writes safely, restarts only if anything changed,
 and offers the OpenCode sync.
 
-Keyboard on Home: arrows navigate, `/` filter, `s` cycle sort, `S` reverse,
-`x` clear filter, `h` hide invalid, `c`/`t`/`v`/`o` jump to
+Keyboard on Home: arrows navigate, `Enter`/click opens a row's detail and
+actions (probe that credential, test via gateway), clicking a header sorts,
+`/` filter, `s` cycle sort,
+`S` reverse, `T` tier filter, `P` probe all (again to cancel), `x` clear filter,
+`h` hide invalid, `c`/`t`/`v`/`o` jump to
 Configure/Test/Review/OpenCode view, `q` quits, `Esc` goes back.
 No network call ever blocks the UI.
 Sanity check without the UI: `llm-proxy-wizard --check`.

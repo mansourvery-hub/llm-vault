@@ -75,6 +75,22 @@ class CapabilityTest(unittest.TestCase):
         self.assertIn(info["mode"], ("AUTO", "SUGGESTED"))
         self.assertEqual(len(info["members"]), 2)
 
+    def test_context_lookup_exact_only(self):
+        self.assertIsNone(w.lookup_context_window("custom", "no-such-model-xyz"))
+        self.assertIsNone(w.lookup_context_window("gemini", ""))
+        self.assertIsNone(w.lookup_context_window("custom", ""))
+        caps = w.infer_capabilities("custom", "no-such-model-xyz")
+        self.assertEqual(caps["context_window"], "unknown")
+
+    def test_context_lookup_known_model(self):
+        try:
+            from litellm import model_cost  # noqa: F401 -- availability probe
+        except Exception:  # noqa: BLE001 -- any import failure means skip
+            self.skipTest("installed litellm model map unavailable")
+        self.assertEqual(w.lookup_context_window("openai", "gpt-4o"), 128000)
+        caps = w.infer_capabilities("openai", "gpt-4o")
+        self.assertEqual(caps["context_window"], 128000)
+
 
 if __name__ == "__main__":
     unittest.main()

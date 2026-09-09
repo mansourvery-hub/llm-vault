@@ -12,7 +12,7 @@ Mental model: **wizard = control plane / config compiler, LiteLLM = runtime rout
 
 - **`wizard.py`** (v2.x, Python 3.10+, PyYAML): interactive CLI. Direct key validation, live catalogs, minimal model probes, quota domains, capability pools, role aliases, `config.yaml` compilation, gateway/pool tests, readiness-aware restart, OpenCode sync offer.
 - **`engine.py`** (stdlib + PyYAML via `wizard`): clean callable facade over `wizard.py`/`sync-opencode.py`. No reimplemented logic. The TUI (and future callers) drive the product through it; network/systemd adapters are mockable, paths overridable.
-- **`tui.py`** (Textual): thin presentation layer — table-first Home dashboard (one row per deployment: pool/provider/model/tier/rpm/tpm/quota/ctx/health) + OpenCode view (exposed aliases grouped with children) + Configure/Provider/Test/Review screens only. Must never contain provider logic, quota math, compilation, secret handling, or OpenCode mutation.
+- **`tui.py`** (Textual): thin presentation layer — table-first Home dashboard (one row per deployment: pool/provider/model/tier/quota/status, click-header sort, tier filter, auto-probe on mount + `P` re-probe, Enter/click row-detail modal with per-credential probe + gateway test; ctx shown in modal only when the litellm map knows it) + OpenCode view (exposed aliases grouped with children) + Quota dashboard (`u`/button: one row per quota domain — keys/RPM/project/confidence via `engine.quota_domains_list`) + Configure/Provider/Test/Review screens only. Must never contain provider logic, quota math, compilation, secret handling, or OpenCode mutation.
 - **`sync-opencode.py`** (stdlib-only): syncs user-facing pools (+roles) into `opencode.json` as a `litellm` block. JSONC-tolerant, backup + atomic write, idempotent, `--dry-run`, never carries secrets.
 - **`tests/`**: stdlib `unittest` suite (fake keys only, mocked HTTP). Run with the venv python (system python lacks PyYAML).
 - **`litellm.service`**: systemd user service on port 4000.
@@ -40,14 +40,16 @@ Key distinctions: `key != quota`, `deployment != model`, `identity != capability
                       "confidence": "manual|provider_default|conservative|unknown"}},
   "_health": {"pid:cred-id": {"status": "ok|throttled|invalid|unknown", ...}},
   "<pid>": {"keys": [...], "credentials": [{"id": "cred-<hash>", "secret": "...",
-             "label": "", "quota_domain": "...", "enabled": true,
+             "label": "", "quota_domain": "...", "project_id": "", "enabled": true,
              "validation": {"status": "...", ...}}],
-            "models": [...], "endpoints": [], "base_url": "...", "disabled": false}
+             "models": [...], "endpoints": [], "base_url": "...", "disabled": false}
 }
 ```
 
 - `keys[]` is kept in sync for backward compat; `credentials[]` is the source of truth. Credential IDs are `cred-<sha256(secret)[:12]>` — stable across reorders, never the raw key.
+- `project_id` (additive, Google projects): keys of one project share one speed limit. `effective_quota_domain()` groups by it (`project:<pid>:<id>`) even over a stale per-credential default; `quota_domains_list()` exposes domains for the TUI dashboard.
 - `migrate_db()` is automatic + idempotent: legacy `_unified` -> `_aliases` (deduped), missing sections defaulted, one-credential-per-domain defaults. Never silently deletes valid config; `normalize_aliases()` cleans stale members visibly.
+- `context_window` comes from the installed litellm model map via `lookup_context_window()` (exact id strings only, lazy import) — else `unknown`, never guessed.
 - Quota semantics: Google = project-scoped (ask bulk grouping); others default to credential/account/unknown per `PROVIDER_META` (only verified facts; else `unknown`).
 
 ### Compiler (`compile_config` -> `generate_yaml`)
@@ -57,8 +59,9 @@ Stages: migrate/normalize -> credentials -> quota -> model metadata -> deploymen
 (pool -> trust tier -> provider -> domain -> credential).
 
 - One deployment = one provider + credential + endpoint + model. Shared-domain RPM is split per (domain, model) — never N x quota.
+- custom_api base URL is single-sourced (`effective_base_url`: explicit arg > stored `endpoints[0]` > stored `base_url` > builtin) and honored identically by validate/catalog/probe/yaml — never hardcode a provider base at a call site.
 - Roles compile to `model_group_alias` (role -> first pool) + `fallbacks` (verified shapes for installed LiteLLM 1.100.0).
-- `router_settings` (verified vs installed LiteLLM): `usage-based-routing-v2`, `num_retries: 1`, `cooldown_time: 60`, `allowed_fails: 1`, `enable_pre_call_checks: true`, retry policy with ONLY supported keys (`Authentication/BadRequest/ContentPolicyViolation/RateLimit: 0`, `Timeout/InternalServer: 1`).
+- `router_settings` (verified vs installed LiteLLM): `usage-based-routing-v2`, `num_retries: 1`, `cooldown_time: 60`, `allowed_fails: 1`, `allowed_fails_policy` (`RateLimit: 0`, `Timeout/InternalServer/ServiceUnavailable/BadGateway: 1`), `enable_pre_call_checks: true`, retry policy with ONLY supported keys (`Authentication/BadRequest/ContentPolicyViolation/RateLimit: 0`, `Timeout/InternalServer: 1`). Per-deployment `litellm_params.cooldown_time`: 60s for 429-prone providers (gemini), 30s otherwise — a 429 cools immediately and the next domain's deployment takes over.
 - `general_settings.master_key` = `os.environ/LITELLM_MASTER_KEY` (env-backed; resolved via `get_master_key()`: env -> `~/.config/litellm/.master_key` (0600) -> generated). No hard-coded secrets.
 - Invariants enforced, failure leaves `config.yaml` untouched: no dup deployments, no stale members, no empty aliases/roles, no missing credentials, no empty endpoints, no pool/role name collisions.
 

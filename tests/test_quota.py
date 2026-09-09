@@ -85,6 +85,45 @@ class QuotaTest(unittest.TestCase):
         self.assertIn(w.PROVIDER_META["openrouter"]["quota_scope"],
                       ("account", "credential", "unknown"))
 
+    def test_project_id_groups_credentials(self):
+        # credentials sharing a project collapse into ONE domain
+        db = w.migrate_db({"gemini": {"keys": ["K1", "K2"], "models": ["m"],
+                                      "endpoints": []}})
+        for c in db["gemini"]["credentials"]:
+            c["project_id"] = "proj-a"
+        self.assertEqual(w.default_quota_domain_id("gemini",
+                         db["gemini"]["credentials"][0]), "project:gemini:proj-a")
+        domains = w.quota_domains_list(db)
+        self.assertEqual(len(domains), 1)
+        self.assertEqual(domains[0]["domain_id"], "project:gemini:proj-a")
+        self.assertEqual(domains[0]["key_count"], 2)
+        self.assertEqual(domains[0]["project_id"], "proj-a")
+
+    def test_no_project_id_stays_per_credential(self):
+        db = w.migrate_db({"gemini": {"keys": ["K1", "K2"], "models": ["m"],
+                                      "endpoints": []}})
+        domains = w.quota_domains_list(db)
+        self.assertEqual(len(domains), 2)
+        self.assertTrue(all(d["domain_id"].startswith("credential:")
+                           for d in domains))
+
+    def test_project_domain_inherits_rpm_once(self):
+        # keys in one project domain share one RPM: never keys x RPM
+        db = w.migrate_db({"gemini": {"keys": ["K1", "K2"], "models": ["m"],
+                                      "endpoints": []}})
+        for c in db["gemini"]["credentials"]:
+            c["project_id"] = "proj-a"
+        w.ensure_quota_domain(db, "project:gemini:proj-a", provider="gemini",
+                              rpm=10, confidence="manual", source="test")
+        deps, _, _, errors = w.compile_config(db)
+        self.assertEqual(errors, [])
+        self.assertLessEqual(sum(d["rpm"] or 0 for d in deps), 10)
+
+    def test_normalize_credentials_defaults_project_id(self):
+        pdata = {"keys": ["K1"], "credentials": [{"id": "cred-x", "secret": "K1"}]}
+        w.normalize_credentials(pdata)
+        self.assertEqual(pdata["credentials"][0].get("project_id"), "")
+
 
 if __name__ == "__main__":
     unittest.main()

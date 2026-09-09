@@ -54,6 +54,7 @@ except ImportError:
     print("    (or: pip install -r requirements.txt)")
     sys.exit(1)
 
+from rich.text import Text
 from textual import on
 from textual.app import App, ComposeResult
 from textual.containers import Vertical
@@ -80,29 +81,61 @@ import engine
 STATUS_MARK = {"running": "[green]●[/]", "stopped": "[red]●[/]",
                "unknown": "[yellow]●[/]"}
 
-# Table columns for the Home dashboard (FCM-style dense table, one row
-# per deployment). Keys are sort/filter ids; labels get a ▲/▼ marker
-# for the active sort column at render time.
+# FCM-inspired presentation palette (display-only; no product semantics).
+# Soft per-provider accents so the column scans at a glance; tier gradient
+# cheap/fast (green) -> heavy (magenta/cyan); health green/yellow/red with
+# dim for never-tested. Missing values render dim, never blank.
+PROVIDER_STYLE = {
+    "gemini": "deep_sky_blue1",
+    "openrouter": "magenta",
+    "zai": "cyan",
+    "tokenrouter": "orange1",
+    "opencode_zen": "purple",
+    "anthropic": "red",
+    "openai": "green",
+    "ollama_cloud": "bright_white",
+    "ollama_local": "white",
+}
+TIER_STYLE = {"flash": "green", "lite": "yellow", "pro": "magenta",
+              "reasoning": "cyan", "unknown": "grey62"}
+HEALTH_STYLE = {"healthy": "green", "partially-throttled": "yellow",
+                "throttled": "yellow", "invalid": "red", "unknown": "grey62"}
+
+# Fixed column widths (content cells): DataTable auto-sizes columns to
+# the visible rows, so filtering/sorting reflowed the whole table on
+# every keystroke. Fixed widths + clipped/padded cells keep it still.
+COLUMN_WIDTHS = {
+    "pool": 24, "provider": 12, "upstream": 24, "tier": 7,
+    "quota": 26, "health": 12, "key": 8,
+}
+
+
+def fit_cell(text: str, width: int) -> str:
+    """Clip (with …) + pad to an exact display width (ASCII content)."""
+    if len(text) > width:
+        text = text[: max(0, width - 1)] + "…"
+    return text.ljust(width)
+
+
 TABLE_COLUMNS = (
     ("pool", "Pool"),
     ("provider", "Provider"),
     ("upstream", "Model"),
     ("tier", "Tier"),
-    ("rpm", "RPM"),
-    ("tpm", "TPM"),
     ("quota", "Quota"),
-    ("ctx", "Ctx"),
-    ("health", "Health"),
+    ("health", "Status"),
     ("key", "Key"),
 )
-SORT_KEYS = ("pool", "provider", "tier", "rpm", "health")
+SORTABLE_COLUMNS = tuple(k for k, _ in TABLE_COLUMNS)
+TIER_CYCLE = ("flash", "lite", "pro", "reasoning", "unknown")
+WORKING_HEALTH = {"healthy", "partially-throttled", "throttled"}
 
 HEALTH_DISPLAY = {
     "healthy": ("✓", "healthy"),
     "partially-throttled": ("~", "part-throttled"),
     "throttled": ("~", "throttled"),
     "invalid": ("✗", "invalid"),
-    "unknown": ("?", "unknown"),
+    "unknown": ("?", "untested"),
 }
 HEALTH_RANK = {"healthy": 0, "partially-throttled": 1, "throttled": 2,
                "unknown": 3, "invalid": 4}
@@ -118,6 +151,34 @@ def _short_quota(qd: str, maxlen: int = 16) -> str:
     if len(short) > maxlen:
         short = short[: maxlen - 1] + "…"
     return short or "—"
+
+
+def format_ctx(n: object) -> str:
+    """Compact context window (``1048576`` -> ``1M``); ``—`` when unknown."""
+    if isinstance(n, bool) or not isinstance(n, (int, float)) or n <= 0:
+        return "—"
+    if n >= 1_000_000:
+        v = n / 1_000_000
+        txt = f"{v:.1f}".rstrip("0").rstrip(".") if v < 10 else f"{v:.0f}"
+        return txt + "M"
+    if n >= 1000:
+        v = n / 1000
+        txt = f"{v:.1f}".rstrip("0").rstrip(".") if v < 10 else f"{v:.0f}"
+        return txt + "K"
+    return str(int(n))
+
+
+def format_limit(rpm: object, tpm: object, shared: int = 1) -> str | None:
+    """One-cell rate limit (``10÷3 RPM``); None when nothing is published."""
+    if isinstance(rpm, bool) or not isinstance(rpm, (int, float)):
+        return None
+    txt = str(int(rpm))
+    if shared > 1:
+        txt += f"÷{shared}"
+    txt += " RPM"
+    if isinstance(tpm, (int, float)) and not isinstance(tpm, bool):
+        txt += f" · {format_ctx(tpm)} TPM"
+    return txt
 
 
 def deployment_table_rows(db: dict[str, Any]) -> list[dict[str, Any]]:
@@ -151,15 +212,10 @@ def deployment_table_rows(db: dict[str, Any]) -> list[dict[str, Any]]:
             upstream = str(d.get("upstream_model") or "")
             caps = d.get("capabilities") or {}
             tier = str(caps.get("tier") or "unknown")
-            ctx = str(caps.get("context_window") or "unknown")
+            ctx_num = caps.get("context_window")
             rpm, tpm = d.get("rpm"), d.get("tpm")
             qd = str(d.get("quota_domain") or "")
             n = counts.get((qd, upstream), 1)
-            if isinstance(rpm, (int, float)):
-                rpm_txt = f"{int(rpm)}÷{n}" if n > 1 else str(int(rpm))
-            else:
-                rpm_txt = "—"
-            tpm_txt = str(int(tpm)) if isinstance(tpm, (int, float)) else "—"
             health = str(d.get("health") or "unknown")
             mark, word = HEALTH_DISPLAY.get(health, ("?", health or "unknown"))
             secret = d.get("secret") or ""
@@ -172,24 +228,36 @@ def deployment_table_rows(db: dict[str, Any]) -> list[dict[str, Any]]:
             rows.append({
                 "pool": pool, "provider": provider, "upstream": upstream,
                 "tier": tier, "rpm": rpm, "tpm": tpm,
-                "rpm_txt": rpm_txt, "tpm_txt": tpm_txt,
-                "quota_domain": qd, "quota": _short_quota(qd),
+                "quota_domain": qd,
+                "quota": f"{format_limit(rpm, tpm, n) or '—'} · {_short_quota(qd)}",
                 "confidence": confidence, "shared": n,
-                "ctx": "—" if ctx in ("unknown", "None", "") else ctx,
+                "ctx_num": ctx_num if isinstance(ctx_num, (int, float)) else None,
+                "ctx": format_ctx(ctx_num),
                 "health": health, "health_txt": f"{mark} {word}",
                 "health_rank": HEALTH_RANK.get(health, 9),
-                "key": suffix,
+                "key": suffix, "credential_id": str(d.get("credential_id") or ""),
                 "endpoint": str(d.get("endpoint") or "—"),
             })
     return rows
 
 
-def filter_table_rows(rows: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
-    """Case-insensitive substring filter over pool/provider/model/quota."""
+def row_key_for(row: dict[str, Any]) -> str:
+    """Stable table row identity across sorts/filters (never positional)."""
+    return "\x00".join((row.get("pool", ""), row.get("provider", ""),
+                        row.get("credential_id", ""), row.get("endpoint", "")))
+
+
+def filter_table_rows(rows: list[dict[str, Any]], query: str,
+                      tier: str | None = None) -> list[dict[str, Any]]:
+    """Case-insensitive substring filter over pool/provider/model/quota,
+    plus an optional exact tier filter (``T`` cycles it)."""
     q = (query or "").strip().lower()
+    out = rows
+    if tier:
+        out = [r for r in out if r["tier"] == tier]
     if not q:
-        return list(rows)
-    return [r for r in rows
+        return list(out)
+    return [r for r in out
             if q in r["pool"].lower() or q in r["provider"].lower()
             or q in r["upstream"].lower() or q in r["quota_domain"].lower()]
 
@@ -197,41 +265,98 @@ def filter_table_rows(rows: list[dict[str, Any]], query: str) -> list[dict[str, 
 def sort_table_rows(rows: list[dict[str, Any]], sort_key: str,
                     reverse: bool = False) -> list[dict[str, Any]]:
     """Sort display rows (pure; never touches the DB)."""
-    key = sort_key if sort_key in SORT_KEYS else "pool"
+    key = sort_key if sort_key in SORTABLE_COLUMNS else "pool"
     def _k(r: dict[str, Any]):
-        if key == "rpm":
+        if key == "quota":
             v = r.get("rpm")
-            return (-1 if v is None else int(v), r["pool"], r["provider"])
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                return (1, 0, r["quota_domain"], r["pool"])
+            return (0, -int(v), r["quota_domain"], r["pool"])
         if key == "health":
             return (r.get("health_rank", 9), r["pool"], r["provider"])
         return (str(r.get(key) or "").lower(), r["pool"], r["provider"])
     return sorted(rows, key=_k, reverse=reverse)
 
 
-def gateway_badge(overview: dict[str, Any], n_deps: int) -> str:
-    """One-line header badge: gateway state + pool/deployment counts."""
+def next_sort(sort_key: str, reverse: bool,
+              column: str) -> tuple[str, bool]:
+    """Pure sort-state transition for header clicks and the ``s`` key:
+    same column toggles direction, new column sorts ascending."""
+    if column == sort_key:
+        return (column, not reverse)
+    return (column, False)
+
+
+def summary_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
+    """Header facts: pools, deployments, working pools, untested deployments.
+
+    A pool counts as *working* when at least one backing deployment is
+    healthy/throttled; *untested* deployments never reported health.
+    """
+    pools: dict[str, list[str]] = {}
+    for r in rows:
+        pools.setdefault(r["pool"], []).append(r["health"])
+    working = sum(1 for hs in pools.values()
+                  if any(h in WORKING_HEALTH for h in hs))
+    return {"pools": len(pools), "deployments": len(rows), "working": working,
+            "untested": sum(1 for r in rows if r["health"] == "unknown")}
+
+
+def gateway_badge(overview: dict[str, Any], counts: dict[str, int],
+                  note: str = "") -> str:
+    """One-line header badge: gateway state + working/untested + totals."""
     mark = STATUS_MARK.get(overview.get("gateway", "unknown"),
                            STATUS_MARK["unknown"])
-    n_pools = len(overview.get("pools", []))
-    return (f"Gateway {mark} {status_word(str(overview.get('gateway', 'unknown')))}"
-            f"  •  {n_pools} pool(s)  •  {n_deps} deployment(s)")
+    text = (f"Gateway {mark} {status_word(str(overview.get('gateway', 'unknown')))}"
+            f"  •  {counts.get('working', 0)}/{counts.get('pools', 0)} models working")
+    if counts.get("untested"):
+        text += f"  •  {counts['untested']} untested"
+    text += f"  •  {counts.get('deployments', 0)} deployment(s)"
+    if note:
+        text += f"  •  {note}"
+    return text
 
 
-def row_detail_text(row: dict[str, Any] | None) -> str:
-    """FCM-style detail card for the highlighted row (full, untruncated)."""
+def credential_validation(db: dict[str, Any], pid: str,
+                          cred_id: str) -> dict[str, str] | None:
+    """Secret-free last-check info for one credential (modal display)."""
+    entry = db.get(pid)
+    if not isinstance(entry, dict):
+        return None
+    for c in entry.get("credentials", []) or []:
+        if isinstance(c, dict) and c.get("id") == cred_id:
+            v = c.get("validation") or {}
+            return {"status": str(v.get("status") or "unknown"),
+                    "checked": str(v.get("checked_at") or "never"),
+                    "message": str(v.get("message") or "")}
+    return None
+
+
+def row_detail_text(row: dict[str, Any] | None,
+                    validation: dict[str, str] | None = None) -> str:
+    """Full detail for one deployment (row modal; everything untruncated)."""
     if row is None:
-        return "↑↓ move • Enter opens details • / filter • s sort • o OpenCode view"
+        return "No row selected."
     shared = ""
     if row.get("shared", 1) > 1:
         shared = (f"  (shared domain: {row['shared']} deployments "
                   f"split this quota — never {row['shared']}×)")
     conf = f" [{row['confidence']}]" if row.get("confidence") else ""
-    return (f"{row['pool']}  via {row['provider']} / {row['upstream']}\n"
-            f"tier {row['tier']} • ctx {row['ctx']} • "
-            f"rpm {row['rpm_txt']} • tpm {row['tpm_txt']} • "
-            f"quota {row['quota_domain'] or '—'}{conf}{shared}\n"
-            f"health {row['health_txt']} • key {row['key']} • "
-            f"endpoint {row['endpoint']}")
+    limit = format_limit(row.get("rpm"), row.get("tpm"), row.get("shared", 1)) or "—"
+    lines = [
+        f"{row['pool']}  via {row['provider']} / {row['upstream']}",
+        (f"tier {row['tier']} • limit {limit} • "
+         f"quota {row['quota_domain'] or '—'}{conf}{shared}"),
+        (f"status {row['health_txt']} • key {row['key']} • "
+         f"endpoint {row['endpoint']}"),
+    ]
+    if row.get("ctx_num"):
+        lines.insert(2, f"ctx {row['ctx']} (installed litellm map)")
+    if validation:
+        msg = f" · {validation['message'][:100]}" if validation.get("message") else ""
+        lines.append(f"last check: {validation['status']} "
+                     f"({validation['checked']}){msg}")
+    return "\n".join(lines)
 
 
 def opencode_view_data(db: dict[str, Any], paths) -> dict[str, Any]:
@@ -283,6 +408,15 @@ def opencode_view_data(db: dict[str, Any], paths) -> dict[str, Any]:
 
 
 # ------------------------------------------------------- pure helpers ---
+
+def _pop_to_home(app: WizardApp) -> None:
+    """Pop the screen stack back to Home (terminal flow transitions).
+
+    Finishing a flow lands Review directly above Home, so Back/Escape
+    goes home instead of walking back through Configure/Probe screens.
+    """
+    while len(app.screen_stack) > 1 and not isinstance(app.screen, HomeScreen):
+        app.pop_screen()
 
 def split_keys(text: str) -> list[str]:
     """Split pasted keys on whitespace/commas, preserving order, deduped."""
@@ -374,20 +508,24 @@ class HomeScreen(Screen):
     """Dashboard table: one row per deployment (FCM-style, keyboard-first).
 
     Keys: ``c`` configure, ``t`` test, ``v`` review, ``o`` OpenCode view,
-    ``/`` filter, ``s`` cycle sort, ``S`` reverse direction, ``x`` clear
-    filter, ``h`` hide invalid, ``q`` quit. Arrows/Enter navigate; the
-    detail card below always describes the highlighted row.
+    ``/`` filter, ``s`` cycle sort, ``S`` reverse direction, ``T`` tier
+    filter, ``P`` probe every credential (again to cancel), ``x`` clear
+    filter, ``h`` hide invalid, ``q`` quit. Clicking a header sorts;
+    Enter/click on a row opens its detail + actions. Status fills itself
+    in on first mount via one background probe per credential.
     """
 
     BINDINGS = [  # noqa: RUF012 -- Textual API
         ("c", "configure", "Configure"), ("t", "test", "Test"),
         ("v", "review", "Review"), ("o", "opencode", "OpenCode"),
+        ("u", "quota", "Quota"),
         ("slash", "focus_filter", "Filter"),
         ("s", "cycle_sort", "Sort"), ("S", "reverse_sort", "Reverse"),
+        ("T", "cycle_tier", "Tier"), ("P", "probe_all", "Probe"),
         ("x", "clear_filter", "Clear"), ("h", "toggle_hide", "Hide bad"),
         ("q", "quit_app", "Quit")]
 
-    SORT_CYCLE = ("pool", "provider", "tier", "rpm", "health")
+    SORT_CYCLE = ("pool", "provider", "tier", "quota", "health")
 
     def __init__(self) -> None:
         super().__init__()
@@ -396,8 +534,13 @@ class HomeScreen(Screen):
         self.view_rows: list[dict[str, Any]] = []
         self.sort_key = "pool"
         self.sort_reverse = False
+        self.tier_filter: str | None = None
         self.hide_invalid = False
-        self._built_columns = False
+        self.probing = False
+        self.probe_note = ""
+        self.counts: dict[str, int] = {}
+        self._probe_stop = None
+        self._worker = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -407,12 +550,16 @@ class HomeScreen(Screen):
             yield Input(placeholder="Filter pools/providers/models ( / to focus, x to clear )",
                         id="home-filter")
             yield DataTable(id="models-table", cursor_type="row")
-            yield Static("", id="row-detail")
+            yield Static("Enter/click a row for details + actions • click a header to sort",
+                         id="home-hint")
             yield Static("", id="home-attention")
             yield Button("Configure", id="go-configure", variant="primary")
+            yield Button("Probe all", id="probe-all")
+            yield Button("Cancel", id="cancel-probe")
             yield Button("OpenCode view", id="go-opencode")
             yield Button("Test", id="go-test")
             yield Button("Review", id="go-review")
+            yield Button("Quota", id="go-quota")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -422,17 +569,15 @@ class HomeScreen(Screen):
         app.refresh_status_background()
         # Keyboard-first like FCM: the table owns focus so single-key
         # actions (c/t/v/o/s/...) fire immediately; / moves to the filter.
-        try:
-            self.query_one("#models-table", DataTable).focus()
-        except NoMatches:
-            pass
+        self._focus_table()
+        # Fill the Status column by itself: one minimal background probe
+        # per credential (skipped when everything already reported).
+        if app.auto_probe and any(r["health"] == "unknown" for r in self.rows):
+            self.action_probe_all()
 
     def on_screen_resume(self) -> None:
         self.refresh_content()
-        try:
-            self.query_one("#models-table", DataTable).focus()
-        except NoMatches:
-            pass
+        self._focus_table()
 
     # -- data --
 
@@ -441,10 +586,9 @@ class HomeScreen(Screen):
         assert isinstance(app, WizardApp)
         overview = engine.gateway_overview(app.db, app.paths, status=app.status)
         self.rows = deployment_table_rows(app.db)
-        badge = gateway_badge(overview, len(self.rows))
+        self.counts = summary_counts(self.rows)
+        badge = gateway_badge(overview, self.counts, self.probe_note)
         self._apply_view()
-        detail_row = self._highlighted_row() or (self.view_rows[0] if self.view_rows else None)
-        detail = row_detail_text(detail_row)
         attention = overview.get("attention") or []
         if not self.rows and not attention:
             attention = ["No models configured yet — choose Configure to add keys."]
@@ -455,87 +599,149 @@ class HomeScreen(Screen):
              *([f"! {a}" for a in attention] if attention else [])])
         try:
             self.query_one("#gateway-badge", Static).update(badge)
-            self.query_one("#row-detail", Static).update(detail)
             self.query_one("#home-attention", Static).update(attn_txt)
+            self._show_probe_buttons()
         except NoMatches:  # not yet mounted
             pass
 
-    def _apply_view(self) -> None:
+    def _show_probe_buttons(self) -> None:
         try:
-            filt = self.query_one("#home-filter", Input).value
+            self.query_one("#probe-all", Button).display = not self.probing
+            self.query_one("#cancel-probe", Button).display = self.probing
         except NoMatches:
-            filt = ""
-        rows = filter_table_rows(self.rows, filt)
-        if self.hide_invalid:
-            rows = [r for r in rows if r["health"] != "invalid"]
-        self.view_rows = sort_table_rows(rows, self.sort_key, self.sort_reverse)
-        self._rebuild_table()
+            pass
 
-    def _rebuild_table(self) -> None:
+    def _focus_table(self) -> None:
         try:
-            table = self.query_one("#models-table", DataTable)
+            self.query_one("#models-table", DataTable).focus()
         except NoMatches:
-            return
-        table.clear(columns=True)
-        for key, label in TABLE_COLUMNS:
-            if key == self.sort_key:
-                label = f"{label} {'▲' if not self.sort_reverse else '▼'}"
-            table.add_column(label, key=key)
-        self._built_columns = True
-        if not self.view_rows:
-            return
-        for i, r in enumerate(self.view_rows):
-            table.add_row(r["pool"], r["provider"], r["upstream"], r["tier"],
-                          r["rpm_txt"], r["tpm_txt"], r["quota"], r["ctx"],
-                          r["health_txt"], r["key"], key=f"row-{i}")
-        try:
-            filt = self.query_one("#home-filter", Input).value.strip()
-        except NoMatches:
-            filt = ""
-        extra = [f"filter '{filt}'"] if filt else []
-        if self.hide_invalid:
-            extra.append("hiding invalid")
-        table.border_title = (f"{len(self.view_rows)}/{len(self.rows)} "
-                              f"sorted by {self.sort_key}"
-                              + (f" ({', '.join(extra)})" if extra else ""))
+            pass
 
-    def _highlighted_row(self) -> dict[str, Any] | None:
-        try:
-            table = self.query_one("#models-table", DataTable)
-        except NoMatches:
-            return None
+    def _cell(self, text: str, width: int, style: str | None = None,
+              dim: bool = False) -> Text:
+        fitted = fit_cell(text, width)
+        if dim:
+            return Text(fitted, style="dim")
+        if style:
+            return Text(fitted, style=style)
+        return Text(fitted)
+
+    def _header_label(self, key: str, label: str) -> Text:
+        # Marker slot is always present (▲/▼/◆ or blank) so headers never
+        # change width when the sort/filter state changes.
+        if key == self.sort_key:
+            mark = "▲" if not self.sort_reverse else "▼"
+        elif key == "tier" and self.tier_filter:
+            mark = "◆"
+        else:
+            mark = " "
+        return Text(fit_cell(f"{label} {mark}", COLUMN_WIDTHS[key]), style="bold")
+
+    def _row_identity_at_cursor(self, table: DataTable) -> str | None:
         try:
             idx = table.cursor_row
         except Exception:  # noqa: BLE001 -- no cursor yet
             return None
         if idx is None or not (0 <= idx < len(self.view_rows)):
             return None
-        return self.view_rows[idx]
+        return row_key_for(self.view_rows[idx])
 
-    def _update_detail(self) -> None:
+    def _apply_view(self) -> None:
         try:
-            self.query_one("#row-detail", Static).update(
-                row_detail_text(self._highlighted_row()))
+            filt = self.query_one("#home-filter", Input).value
         except NoMatches:
-            pass
+            filt = ""
+        # Snapshot the highlighted identity BEFORE swapping view_rows,
+        # or the cursor index would resolve against the new list.
+        try:
+            table = self.query_one("#models-table", DataTable)
+            prev_key = self._row_identity_at_cursor(table)
+        except NoMatches:
+            prev_key = None
+        rows = filter_table_rows(self.rows, filt, self.tier_filter)
+        if self.hide_invalid:
+            rows = [r for r in rows if r["health"] != "invalid"]
+        self.view_rows = sort_table_rows(rows, self.sort_key, self.sort_reverse)
+        self._rebuild_table(prev_key)
+
+    def _rebuild_table(self, prev_key: str | None = None) -> None:
+        try:
+            table = self.query_one("#models-table", DataTable)
+        except NoMatches:
+            return
+        # Snapshot the viewport so rebuilds never jump the scroll (the
+        # clear() below resets it, which reads as rows flashing in/out).
+        try:
+            scroll = table.scroll_offset
+            scroll_xy = (scroll.x, scroll.y)
+        except Exception:  # noqa: BLE001 -- unscrolled table
+            scroll_xy = None
+        table.clear(columns=True)
+        for key, label in TABLE_COLUMNS:
+            table.add_column(self._header_label(key, label), key=key,
+                             width=COLUMN_WIDTHS[key])
+        for r in self.view_rows:
+            table.add_row(
+                self._cell(r["pool"], COLUMN_WIDTHS["pool"]),
+                self._cell(r["provider"], COLUMN_WIDTHS["provider"],
+                           PROVIDER_STYLE.get(r["provider"])),
+                self._cell(r["upstream"], COLUMN_WIDTHS["upstream"]),
+                self._cell(r["tier"], COLUMN_WIDTHS["tier"],
+                           TIER_STYLE.get(r["tier"], "grey62")),
+                self._cell(r["quota"], COLUMN_WIDTHS["quota"]),
+                self._cell(r["health_txt"], COLUMN_WIDTHS["health"],
+                           HEALTH_STYLE.get(r["health"], "grey62")),
+                self._cell(r["key"], COLUMN_WIDTHS["key"], dim=True),
+                key=row_key_for(r))
+        if prev_key is not None:
+            for i, r in enumerate(self.view_rows):
+                if row_key_for(r) == prev_key:
+                    table.move_cursor(row=i, animate=False, scroll=False)
+                    break
+        if scroll_xy is not None and table.row_count:
+            table.scroll_to(x=scroll_xy[0], y=scroll_xy[1], animate=False)
+        try:
+            filt = self.query_one("#home-filter", Input).value.strip()
+        except NoMatches:
+            filt = ""
+        extra = []
+        if filt:
+            extra.append(f"filter '{filt}'")
+        if self.tier_filter:
+            extra.append(f"tier={self.tier_filter}")
+        if self.hide_invalid:
+            extra.append("hiding invalid")
+        table.border_title = (f"{len(self.view_rows)}/{len(self.rows)} "
+                              f"sorted by {self.sort_key}"
+                              + (f" ({', '.join(extra)})" if extra else ""))
 
     # -- events --
 
     @on(Input.Changed, "#home-filter")
     def _filter_changed(self, _event: Input.Changed) -> None:
         self._apply_view()
-        self._update_detail()
 
     @on(Input.Submitted, "#home-filter")
     def _filter_submitted(self, _event: Input.Submitted) -> None:
-        try:
-            self.query_one("#models-table", DataTable).focus()
-        except NoMatches:
-            pass
+        self._focus_table()
 
-    @on(DataTable.RowHighlighted)
-    def _row_highlighted(self, _event: DataTable.RowHighlighted) -> None:
-        self._update_detail()
+    @on(DataTable.HeaderSelected)
+    def _header_clicked(self, event: DataTable.HeaderSelected) -> None:
+        key = getattr(event.column_key, "value", event.column_key)
+        self._sort_by_column(str(key))
+
+    @on(DataTable.RowSelected)
+    def _row_chosen(self, event: DataTable.RowSelected) -> None:
+        idx = event.cursor_row
+        if idx is not None and 0 <= idx < len(self.view_rows):
+            self.app.push_screen(ModelDetailScreen(self.view_rows[idx]))
+
+    def _sort_by_column(self, column: str) -> None:
+        """Header click sorts (repeat click reverses); unknown keys ignore."""
+        if column in SORTABLE_COLUMNS:
+            self.sort_key, self.sort_reverse = next_sort(
+                self.sort_key, self.sort_reverse, column)
+            self._apply_view()
 
     # -- actions --
 
@@ -550,6 +756,9 @@ class HomeScreen(Screen):
 
     def action_opencode(self) -> None:
         self.app.push_screen(OpenCodeScreen())
+
+    def action_quota(self) -> None:
+        self.app.push_screen(QuotaDashboardScreen())
 
     def action_focus_filter(self) -> None:
         try:
@@ -566,6 +775,17 @@ class HomeScreen(Screen):
         self.sort_reverse = not self.sort_reverse
         self._apply_view()
 
+    def action_cycle_tier(self) -> None:
+        if self.tier_filter is None:
+            self.tier_filter = TIER_CYCLE[0]
+        else:
+            try:
+                i = TIER_CYCLE.index(self.tier_filter)
+                self.tier_filter = TIER_CYCLE[i + 1] if i + 1 < len(TIER_CYCLE) else None
+            except ValueError:
+                self.tier_filter = None
+        self._apply_view()
+
     def action_clear_filter(self) -> None:
         try:
             inp = self.query_one("#home-filter", Input)
@@ -573,12 +793,83 @@ class HomeScreen(Screen):
             self.query_one("#models-table", DataTable).focus()
         except NoMatches:
             pass
+        self.tier_filter = None
         self._apply_view()
-        self._update_detail()
 
     def action_toggle_hide(self) -> None:
         self.hide_invalid = not self.hide_invalid
         self._apply_view()
+
+    def action_probe_all(self) -> None:
+        if self.probing:
+            self._cancel_probe()
+            return
+        if not self.rows:
+            return
+        import threading
+        self.probing = True
+        self.probe_note = "probe starting…"
+        self._probe_stop = threading.Event()
+        self._show_probe_buttons()
+        self._worker = self.run_worker(self._probe_task(), exclusive=True)
+
+    async def _probe_task(self) -> None:
+        import asyncio as _asyncio
+        app = self.app
+        assert isinstance(app, WizardApp)
+
+        def _progress(pid: str, model: str, done: int, total: int) -> None:
+            app.call_from_thread(self._probe_progress, pid, model, done, total)
+
+        try:
+            counts = await _asyncio.to_thread(
+                _quiet_call, engine.refresh_credential_health,
+                app.db, 1.0, _progress, self._probe_stop)
+        except _asyncio.CancelledError:
+            self.probe_note = "probe cancelled"
+            self.probing = False
+            self._probe_stop = None
+            self._show_probe_buttons()
+            self.refresh_content()
+            self._focus_table()
+            return
+        try:
+            engine.save_state(app.db, app.paths)
+        except OSError:
+            pass
+        stopped = self._probe_stop is not None and self._probe_stop.is_set()
+        self.probing = False
+        self._probe_stop = None
+        parts = [f"{counts.get('ok', 0)} ok"]
+        if counts.get("throttled"):
+            parts.append(f"{counts['throttled']} throttled")
+        if counts.get("invalid"):
+            parts.append(f"{counts['invalid']} invalid")
+        if counts.get("unknown"):
+            parts.append(f"{counts['unknown']} unknown")
+        self.probe_note = ("last probe: " + " · ".join(parts)
+                           + (" (stopped early)" if stopped else ""))
+        self._show_probe_buttons()
+        self.refresh_content()
+        self._focus_table()
+
+    def _probe_progress(self, pid: str, model: str, done: int, total: int) -> None:
+        self.probe_note = f"probing {done}/{total}: {model}"
+        app = self.app
+        assert isinstance(app, WizardApp)
+        overview = engine.gateway_overview(app.db, app.paths, status=app.status)
+        try:
+            self.query_one("#gateway-badge", Static).update(
+                gateway_badge(overview, self.counts or summary_counts(self.rows),
+                              self.probe_note))
+        except NoMatches:
+            pass
+
+    def _cancel_probe(self) -> None:
+        if self._probe_stop is not None:
+            self._probe_stop.set()
+        if self._worker is not None:
+            self._worker.cancel()
 
     def action_quit_app(self) -> None:
         self.app.exit()
@@ -586,6 +877,14 @@ class HomeScreen(Screen):
     @on(Button.Pressed, "#go-configure")
     def _go_configure(self) -> None:
         self.action_configure()
+
+    @on(Button.Pressed, "#probe-all")
+    def _go_probe_all(self) -> None:
+        self.action_probe_all()
+
+    @on(Button.Pressed, "#cancel-probe")
+    def _go_cancel_probe(self) -> None:
+        self._cancel_probe()
 
     @on(Button.Pressed, "#go-opencode")
     def _go_opencode(self) -> None:
@@ -598,6 +897,165 @@ class HomeScreen(Screen):
     @on(Button.Pressed, "#go-review")
     def _go_review(self) -> None:
         self.action_review()
+
+    @on(Button.Pressed, "#go-quota")
+    def _go_quota(self) -> None:
+        self.action_quota()
+
+
+class ModelDetailScreen(Screen):
+    """Row detail + actions: full info for one deployment, with a live
+    credential probe and a gateway test for its pool. Enter/click on a
+    Home row opens it; ``Esc`` goes back (Home refreshes on resume)."""
+
+    BINDINGS = [("escape", "back", "Back")]  # noqa: RUF012 -- Textual API
+
+    def __init__(self, row: dict[str, Any]) -> None:
+        super().__init__()
+        self.row = dict(row)
+        self.last_status = ""
+        self._worker = None
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with Vertical(id="body"):
+            yield Label(f"{self.row.get('pool', '')}", id="title")
+            yield Static("", id="detail-info")
+            yield Static("", id="detail-status")
+            yield Button("Probe this credential", id="probe-cred", variant="primary")
+            yield Button("Test via gateway", id="gw-test")
+            yield Button("Cancel", id="cancel")
+            yield Button("Back", id="back")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self._render_info()
+        self._show_only("probe-cred", "gw-test", "back")
+
+    def _live_row(self) -> dict[str, Any]:
+        """Re-resolve the row so health/probe results are never stale."""
+        app = self.app
+        assert isinstance(app, WizardApp)
+        for r in deployment_table_rows(app.db):
+            if (r["pool"] == self.row.get("pool")
+                    and r["provider"] == self.row.get("provider")
+                    and r["credential_id"] == self.row.get("credential_id")):
+                self.row = r
+                break
+        return self.row
+
+    def _render_info(self) -> None:
+        app = self.app
+        assert isinstance(app, WizardApp)
+        row = self._live_row()
+        validation = credential_validation(app.db, row["provider"],
+                                           row["credential_id"])
+        try:
+            self.query_one("#detail-info", Static).update(
+                row_detail_text(row, validation))
+            self.query_one("#detail-status", Static).update(self.last_status)
+        except NoMatches:
+            pass
+
+    def _show_only(self, *ids: str) -> None:
+        for bid in ("probe-cred", "gw-test", "cancel", "back"):
+            try:
+                self.query_one(f"#{bid}", Button).display = bid in ids
+            except NoMatches:
+                pass
+
+    def _find_deployment(self) -> dict[str, Any] | None:
+        app = self.app
+        assert isinstance(app, WizardApp)
+        _deps, pools, _roles, _errors = engine.compile_config(app.db)
+        for d in pools.get(self.row.get("pool", ""), []):
+            if (d.get("provider") == self.row.get("provider")
+                    and str(d.get("credential_id") or "")
+                    == self.row.get("credential_id")):
+                return d
+        return None
+
+    @on(Button.Pressed, "#probe-cred")
+    def _probe_cred(self) -> None:
+        dep = self._find_deployment()
+        if dep is None or not dep.get("secret"):
+            self.last_status = "Nothing to probe (local engine or missing key)."
+            self._render_info()
+            return
+        self.last_status = f"Probing {dep.get('upstream_model')}…"
+        self._render_info()
+        self._show_only("cancel", "back")
+        self._worker = self.run_worker(self._probe_task(dep), exclusive=True)
+
+    async def _probe_task(self, dep: dict[str, Any]) -> None:
+        import asyncio as _asyncio
+        app = self.app
+        assert isinstance(app, WizardApp)
+        try:
+            results = await _asyncio.to_thread(
+                _quiet_call, engine.probe_models,
+                str(dep.get("provider") or ""), [str(dep.get("upstream_model") or "")],
+                dep.get("secret"), dep.get("endpoint"),
+                keys=[dep["secret"]] if dep.get("secret") else None,
+                mode="FAST", db=app.db, sleep_s=0)
+        except _asyncio.CancelledError:
+            self.last_status = "Probe cancelled."
+            self._render_info()
+            self._show_only("probe-cred", "gw-test", "back")
+            return
+        try:
+            engine.save_state(app.db, app.paths)
+        except OSError:
+            pass
+        if results:
+            _m, cls, msg = results[0]
+            verdict = {"OK": "✓ works", "RATE_LIMITED": "~ throttled"}.get(cls, f"✗ {msg[:120]}")
+            self.last_status = f"{verdict} — health saved."
+        else:
+            self.last_status = "No result."
+        self._render_info()
+        self._show_only("probe-cred", "gw-test", "back")
+
+    @on(Button.Pressed, "#gw-test")
+    def _gw_test(self) -> None:
+        app = self.app
+        assert isinstance(app, WizardApp)
+        pool = str(self.row.get("pool") or "")
+        self.last_status = f"Testing {pool} through the gateway…"
+        self._render_info()
+        self._show_only("cancel", "back")
+        self._worker = self.run_worker(self._gw_task(pool), exclusive=True)
+
+    async def _gw_task(self, pool: str) -> None:
+        import asyncio as _asyncio
+        app = self.app
+        assert isinstance(app, WizardApp)
+        try:
+            aliases = await _asyncio.to_thread(
+                _quiet_call, engine.gateway_aliases, app.paths)
+            if pool not in aliases:
+                self.last_status = "Pool is not applied yet — Review & Apply first."
+            else:
+                cls, msg = await _asyncio.to_thread(
+                    _quiet_call, engine.probe_gateway_alias, pool, app.paths)
+                self.last_status = ("✓ gateway OK" if cls == "OK"
+                                    else f"{cls}: {msg[:140]}")
+        except _asyncio.CancelledError:
+            self.last_status = "Test cancelled."
+        self._render_info()
+        self._show_only("probe-cred", "gw-test", "back")
+
+    @on(Button.Pressed, "#cancel")
+    def _cancel(self) -> None:
+        if self._worker is not None:
+            self._worker.cancel()
+
+    def action_back(self) -> None:
+        self.app.pop_screen()
+
+    @on(Button.Pressed, "#back")
+    def _back(self) -> None:
+        self.action_back()
 
 
 class ConfigureScreen(Screen):
@@ -657,6 +1115,7 @@ class ProviderScreen(Screen):
         self.secrets: list[str] = []
         self.results: list[tuple[str, bool, str]] = []
         self.endpoint: str | None = None
+        self._endpoint_edited = False
         self.last_result = ""
         self._worker = None
 
@@ -687,6 +1146,15 @@ class ProviderScreen(Screen):
         yield Footer()
 
     def on_mount(self) -> None:
+        # Pre-fill the known base URL (stored override > stored base >
+        # builtin default) — the user only edits it when it is wrong.
+        try:
+            if self._is_custom_api():
+                default = self._endpoint_default()
+                if default:
+                    self.query_one("#endpoint-input", Input).value = default
+        except NoMatches:
+            pass
         self._show_state()
 
     # -- state --
@@ -696,15 +1164,20 @@ class ProviderScreen(Screen):
         for bid in self.BUTTONS:
             self.query_one(f"#{bid}", Button).display = bid in wanted
 
-    def _needs_endpoint(self) -> bool:
+    def _is_custom_api(self) -> bool:
         app = self.app
         assert isinstance(app, WizardApp)
         prov = engine.get_provider(self.pid, app.db) or {}
-        if prov.get("type") == "custom_api" and not prov.get("base_url"):
-            return True
-        entry = app.db.get(self.pid)
-        return bool(isinstance(entry, dict) and prov.get("type") == "custom_api"
-                    and not entry.get("base_url") and not entry.get("endpoints"))
+        return prov.get("type") == "custom_api"
+
+    def _endpoint_default(self) -> str | None:
+        app = self.app
+        assert isinstance(app, WizardApp)
+        return engine.effective_endpoint(app.db, self.pid)
+
+    def _needs_endpoint(self) -> bool:
+        """True only when a base URL is required but none is known."""
+        return self._is_custom_api() and not self._endpoint_default()
 
     def _show_state(self) -> None:
         try:
@@ -715,9 +1188,13 @@ class ProviderScreen(Screen):
         except NoMatches:  # not yet mounted
             return
         keys_box.display = self.phase in ("keys", "checking")
-        ep_box.display = self.phase == "keys" and self._needs_endpoint()
+        ep_box.display = self.phase == "keys" and self._is_custom_api()
         if self.phase == "keys":
-            status.update("Paste one or more keys, then check them.")
+            if self._is_custom_api() and self._endpoint_default():
+                status.update("Paste one or more keys, then check them.\n"
+                              "Base URL is pre-filled — fix it if yours differs.")
+            else:
+                status.update("Paste one or more keys, then check them.")
             results.update("")
             self._show_only("check", "back")
         elif self.phase == "checking":
@@ -747,15 +1224,19 @@ class ProviderScreen(Screen):
     @on(Button.Pressed, "#check")
     def _check(self) -> None:
         self.secrets = split_keys(self.query_one("#keys-input", TextArea).text)
-        if self._needs_endpoint():
-            self.endpoint = self.query_one("#endpoint-input", Input).value.strip() or None
-            if not self.endpoint:
+        if self._is_custom_api():
+            typed = self.query_one("#endpoint-input", Input).value.strip() or None
+            default = self._endpoint_default()
+            if typed is None and default is None:
                 self.last_result = "Enter the base URL first."
                 self.phase = "keys"
                 self._show_state()
                 return
+            self.endpoint = typed or default
+            self._endpoint_edited = typed is not None and typed != default
         else:
             self.endpoint = None
+            self._endpoint_edited = False
         if not self.secrets:
             self.last_result = "Paste at least one key first."
             self.phase = "keys"
@@ -810,7 +1291,8 @@ class ProviderScreen(Screen):
         valid = [s for s, ok, _ in self.results if ok]
         try:
             engine.add_credentials(app.db, self.pid, valid,
-                                   endpoint=self.endpoint)
+                                   endpoint=(self.endpoint
+                                             if self._endpoint_edited else None))
             engine.save_state(app.db, app.paths)
         except OSError as e:
             self.last_result = f"Could not save: {e}"
@@ -1114,6 +1596,7 @@ class ModelScreen(Screen):
             names = ", ".join(f"'{s}'" for s in created)
             review.last_status = (f"✓ {names} now served from multiple "
                                   "providers automatically.")
+        _pop_to_home(app)
         app.push_screen(review)
 
     @on(Button.Pressed, "#change-selection")
@@ -1366,7 +1849,10 @@ class TestScreen(Screen):
 
     @on(Button.Pressed, "#review")
     def _review(self) -> None:
-        self.app.push_screen(DoneScreen())
+        app = self.app
+        assert isinstance(app, WizardApp)
+        _pop_to_home(app)
+        app.push_screen(DoneScreen())
 
     @on(Button.Pressed, "#cancel")
     def _cancel(self) -> None:
@@ -1692,6 +2178,84 @@ class DoneScreen(Screen):
         self.action_back()
 
 
+class QuotaDashboardScreen(Screen):
+    """Quota-domain dashboard: one row per speed-limit bucket.
+
+    Emphasizes independent quota domains, not raw key counts: keys in
+    one domain share its limit; domains don't add up. Google
+    ``project:<pid>:<id>`` domains carry the project id.
+    """
+
+    BINDINGS = [("escape", "back", "Back"),  # noqa: RUF012 -- Textual API
+                ("r", "refresh", "Refresh")]
+
+    COLUMNS = (("domain", "Domain"), ("provider", "Provider"),
+               ("keys", "Keys"), ("rpm", "RPM"),
+               ("project", "Project"), ("confidence", "Confidence"))
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.domains: list[dict[str, Any]] = []
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with Vertical(id="body"):
+            yield Label("Quota Domains", id="title")
+            yield Static("", id="quota-status")
+            yield DataTable(id="quota-table", cursor_type="row")
+            yield Button("Refresh", id="refresh")
+            yield Button("Back to Home", id="back")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self._rebuild_table()
+
+    def on_screen_resume(self) -> None:
+        self._rebuild_table()
+
+    def action_refresh(self) -> None:
+        self._rebuild_table()
+
+    @on(Button.Pressed, "#refresh")
+    def _refresh(self) -> None:
+        self._rebuild_table()
+
+    def _rebuild_table(self) -> None:
+        app = self.app
+        assert isinstance(app, WizardApp)
+        self.domains = engine.quota_domains_list(app.db)
+        total_keys = sum(d["key_count"] for d in self.domains)
+        table = self.query_one("#quota-table", DataTable)
+        table.clear(columns=True)
+        for _key, label in self.COLUMNS:
+            table.add_column(label, key=_key)
+        for d in sorted(self.domains, key=lambda x: (x["provider"], x["domain_id"])):
+            rpm = str(d["rpm"]) if d.get("rpm") else "?"
+            table.add_row(
+                fit_cell(str(d["domain_id"]), 34),
+                fit_cell(str(d["provider"]), 12),
+                str(d["key_count"]),
+                rpm,
+                fit_cell(str(d.get("project_id") or "—"), 18),
+                fit_cell(str(d.get("confidence") or "—"), 12),
+            )
+        status = (f"{len(self.domains)} independent domain(s), {total_keys} key(s) — "
+                  "keys in one domain share its speed; more keys there won't add up.")
+        if len(self.domains) != total_keys:
+            status += f" ({total_keys - len(self.domains)} key(s) saved by sharing)."
+        try:
+            self.query_one("#quota-status", Static).update(status)
+        except NoMatches:
+            pass
+
+    def action_back(self) -> None:
+        self.app.pop_screen()
+
+    @on(Button.Pressed, "#back")
+    def _back(self) -> None:
+        self.action_back()
+
+
 # ------------------------------------------------------------------ app ---
 
 class WizardApp(App):
@@ -1704,24 +2268,31 @@ class WizardApp(App):
     #home-content, #test-status, #test-results, #done-content { margin-bottom: 1; }
     #home-attention, #opencode-status { margin: 1 0; }
     #home-filter { margin-bottom: 1; }
+    #home-hint { margin-bottom: 1; }
     #models-table { height: 14; margin-bottom: 1; }
     #opencode-tree { height: 16; margin-bottom: 1; }
-    #row-detail { margin: 1 0; border: solid #444444; padding: 0 1; }
+    #quota-status { margin-bottom: 1; }
+    #quota-table { height: 14; margin-bottom: 1; }
     #keys-input { height: 6; margin-bottom: 1; }
     #manual-input { height: 4; margin-bottom: 1; }
     #model-list { height: 12; margin-bottom: 1; }
     #endpoint-input, #filter { margin-bottom: 1; }
     #phase-status, #check-results, #model-status, #apply-status { margin: 1 0; }    Button { margin-bottom: 1; }
+    #detail-info, #detail-status { margin: 1 0; }
     """
 
     def __init__(self, paths: engine.EnginePaths | None = None,
-                 status: str | None = None, status_auto_refresh: bool = True) -> None:
+                  status: str | None = None, status_auto_refresh: bool = True,
+                  auto_probe: bool = True) -> None:
         super().__init__()
         self.paths = paths or engine.EnginePaths.from_env()
         self.db: dict[str, Any] = engine.load_state(self.paths)
         self.status = status or "unknown"
         # Note: named to avoid colliding with Textual's own auto_refresh.
         self.status_auto_refresh = status_auto_refresh and status is None
+        # Fill the Status column on first mount (one background probe per
+        # credential); tests pass False to stay offline.
+        self.auto_probe = auto_probe
 
     def on_mount(self) -> None:
         self.push_screen(HomeScreen())

@@ -272,6 +272,12 @@ def discover_models(pid: str, key: str,
     return _wiz.fetch_catalog(pid, key, endpoint)
 
 
+def effective_endpoint(db: dict[str, Any], pid: str) -> str | None:
+    """Pre-filled base URL for a custom_api provider: stored override >
+    stored base > builtin default (None when nothing is known)."""
+    return _wiz.effective_base_url(db, pid, None)
+
+
 # ------------------------------------------------------------------ quota ---
 
 def calculate_quota_domains(db: dict[str, Any],
@@ -328,6 +334,11 @@ def set_quota_domains(db: dict[str, Any], pid: str, mode: str) -> str:
     entry["quota_reviewed"] = True
     _wiz.migrate_db(db)
     return "separate"
+
+
+def quota_domains_list(db: dict[str, Any]) -> list[dict[str, Any]]:
+    """Structured quota-domain facts for the TUI dashboard (via wizard)."""
+    return _wiz.quota_domains_list(db)
 
 
 def calculate_capacity(db: dict[str, Any], members) -> dict[str, Any]:
@@ -419,6 +430,60 @@ def probe_models(pid: str, models: list[str], key: str | None,
     return _wiz.test_models(pid, list(models), key, endpoint, keys=keys,
                             mode=mode, sample_size=sample_size, db=db,
                             sleep_s=sleep_s)
+
+
+def refresh_credential_health(db: dict[str, Any], sleep_s: float = 1.0,
+                              progress=None, stop=None) -> dict[str, int]:
+    """Probe one model per credential, persisting validation in ``db``.
+
+    Health is tracked per credential in the schema, so a single minimal
+    probe per credential refreshes every deployment backed by it (far
+    cheaper than probing all N deployments). Secrets never leave this
+    function. ``progress(pid, model, done, total)`` reports each step;
+    ``stop`` (a ``threading.Event``) aborts between probes. Returns
+    outcome counts ``{"checked", "ok", "throttled", "invalid", "unknown"}``.
+    Callers persist with :func:`save_state` and recompile to display.
+    """
+    import time as _time
+
+    targets: list[tuple[str, str, str, str | None]] = []
+    for pid, pdata in db.items():
+        if pid.startswith("_") or not isinstance(pdata, dict):
+            continue
+        models = [m for m in pdata.get("models", []) or []
+                  if isinstance(m, str) and m]
+        if not models:
+            continue
+        endpoints = pdata.get("endpoints", []) or []
+        ep = endpoints[0] if endpoints else None
+        for cred in _wiz.iter_credentials(pdata):
+            if cred.get("enabled") is False or cred.get("quarantined"):
+                continue
+            secret = cred.get("secret")
+            if not secret:
+                continue  # local/secretless engines have no upstream health
+            targets.append((pid, models[0], secret, ep))
+    counts = {"checked": 0, "ok": 0, "throttled": 0, "invalid": 0,
+              "unknown": 0}
+    total = len(targets)
+    for i, (pid, model, secret, ep) in enumerate(targets):
+        if stop is not None and stop.is_set():
+            break
+        if progress is not None:
+            progress(pid, model, i + 1, total)
+        try:
+            results = _wiz.test_models(pid, [model], secret, ep,
+                                       keys=[secret], mode="FAST", db=db,
+                                       sleep_s=0)
+            cls = results[0][1] if results else "UNKNOWN"
+        except Exception:  # noqa: BLE001 -- one bad probe never aborts the sweep
+            cls = "UNKNOWN"
+        counts["checked"] += 1
+        counts[{"OK": "ok", "RATE_LIMITED": "throttled",
+                "AUTH_ERROR": "invalid"}.get(cls, "unknown")] += 1
+        if sleep_s and i != total - 1:
+            _time.sleep(sleep_s)
+    return counts
 
 
 def get_combined_models(db: dict[str, Any]) -> dict[str, list[dict[str, str]]]:
