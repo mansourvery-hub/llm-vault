@@ -225,6 +225,7 @@ def deployment_table_rows(db: dict[str, Any]) -> list[dict[str, Any]]:
                 confidence = str((quota_conf.get(qd) or {}).get("confidence") or "")
             except AttributeError:
                 confidence = ""
+            lat = engine.probe_latency(db, provider, upstream)
             rows.append({
                 "pool": pool, "provider": provider, "upstream": upstream,
                 "tier": tier, "rpm": rpm, "tpm": tpm,
@@ -233,6 +234,8 @@ def deployment_table_rows(db: dict[str, Any]) -> list[dict[str, Any]]:
                 "confidence": confidence, "shared": n,
                 "ctx_num": ctx_num if isinstance(ctx_num, (int, float)) else None,
                 "ctx": format_ctx(ctx_num),
+                "latency": lat,
+                "latency_txt": f"{lat:.1f}s" if lat else "—",
                 "health": health, "health_txt": f"{mark} {word}",
                 "health_rank": HEALTH_RANK.get(health, 9),
                 "key": suffix, "credential_id": str(d.get("credential_id") or ""),
@@ -347,8 +350,8 @@ def row_detail_text(row: dict[str, Any] | None,
         f"{row['pool']}  via {row['provider']} / {row['upstream']}",
         (f"tier {row['tier']} • limit {limit} • "
          f"quota {row['quota_domain'] or '—'}{conf}{shared}"),
-        (f"status {row['health_txt']} • key {row['key']} • "
-         f"endpoint {row['endpoint']}"),
+        (f"status {row['health_txt']} • probe latency {row.get('latency_txt') or '—'} • "
+         f"key {row['key']} • endpoint {row['endpoint']}"),
     ]
     if row.get("ctx_num"):
         lines.insert(2, f"ctx {row['ctx']} (installed litellm map)")
@@ -2016,6 +2019,7 @@ class DoneScreen(Screen):
         self.last_status = ""
         self.applied_ok = False
         self.suggestions: dict[str, list[dict[str, str]]] = {}
+        self.free_first: dict[str, dict[str, Any]] = {}
         self._worker = None
 
     def compose(self) -> ComposeResult:
@@ -2026,6 +2030,7 @@ class DoneScreen(Screen):
             yield Static("", id="apply-status")
             yield Button("Apply changes", id="apply", variant="primary")
             yield Button("Group suggested models", id="group-suggested")
+            yield Button("Add free-first roles", id="free-first")
             yield Button("Sync OpenCode", id="sync")
             yield Button("Cancel", id="cancel")
             yield Button("Back to Home", id="back")
@@ -2041,6 +2046,7 @@ class DoneScreen(Screen):
         app = self.app
         assert isinstance(app, WizardApp)
         self.suggestions = engine.pending_suggestions(app.db)
+        self.free_first = engine.suggest_free_first_roles(app.db)
         self.last_content = done_lines(app.db)
         if self.suggestions:
             lines = ["", "Same model on several providers? Group only if",
@@ -2049,13 +2055,20 @@ class DoneScreen(Screen):
                 provs = ", ".join(sorted({m["provider"] for m in members}))
                 lines.append(f"  ? {stem}  ({provs})")
             self.last_content += "\n".join(lines)
+        if self.free_first:
+            lines = ["", "Free Google capacity available as one name:"]
+            for role, spec in sorted(self.free_first.items()):
+                lines.append(f"  ? {role} -> {', '.join(spec['pools'])}")
+            self.last_content += "\n".join(lines)
         self.query_one("#done-content", Static).update(self.last_content)
         self.query_one("#apply-status", Static).update(self.last_status)
-        for bid in ("apply", "group-suggested", "sync", "cancel", "back"):
+        for bid in ("apply", "group-suggested", "free-first", "sync", "cancel", "back"):
             self.query_one(f"#{bid}", Button).display = bid in self._visible_ids()
 
     def _visible_ids(self) -> list[str]:
         ids = ["group-suggested"] if self.suggestions else []
+        if self.free_first:
+            ids.append("free-first")
         if self.applied_ok:
             return [*ids, "sync", "back"]
         return ["apply", *ids, "back"]
@@ -2089,6 +2102,19 @@ class DoneScreen(Screen):
         if skipped:
             note += (" Could not group (incompatible): " + ", ".join(skipped) + ".")
         self._set_status((note or "Nothing grouped.").strip())
+        self.refresh_content()
+
+    @on(Button.Pressed, "#free-first")
+    def _free_first(self) -> None:
+        app = self.app
+        assert isinstance(app, WizardApp)
+        applied, skipped = engine.apply_free_first_roles(app.db)
+        if applied:
+            engine.save_state(app.db, app.paths)
+            self.applied_ok = False  # roles changed -> apply again
+            self._set_status(f"Added {', '.join(applied)}. Review, then Apply again.")
+        else:
+            self._set_status("Nothing added (roles exist or no matching pools).")
         self.refresh_content()
 
     @on(Button.Pressed, "#apply")

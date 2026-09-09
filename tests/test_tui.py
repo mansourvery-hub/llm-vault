@@ -712,6 +712,53 @@ class ConfigureFlowTest(unittest.IsolatedAsyncioTestCase):
                 await _wait_until(lambda: "not ready" in screen.last_status)
                 self.assertFalse(screen.applied_ok)
 
+    async def test_free_first_roles_button(self):
+        app, paths = self.make_app()
+        db = engine.load_state(paths)
+        engine.add_credentials(db, "gemini", ["GK1-FAKE"])
+        engine.set_models(db, "gemini", ["gemini-3.7-flash", "gemini-3.0-thinking"])
+        engine.save_state(db, paths)
+        app.db = engine.load_state(paths)
+        async with app.run_test(size=(100, 50)) as pilot:
+            await pilot.pause()
+            app.push_screen(DoneScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, DoneScreen)
+            # both suggestions visible + button offered
+            self.assertIn("google-free-fast", screen.last_content)
+            self.assertIn("google-free-smart", screen.last_content)
+            btn = screen.query_one("#free-first", tui.Button)
+            self.assertTrue(btn.display)
+            await pilot.click("#free-first")
+            await pilot.pause()
+            self.assertIn("Added google-free-fast", screen.last_status)
+            roles = app.db[engine._wiz.ROLES_KEY]
+            self.assertEqual(roles["google-free-fast"]["pools"],
+                             ["gemini-3.7-flash"])
+            self.assertEqual(roles["google-free-smart"]["pools"],
+                             ["gemini-3.0-thinking"])
+            # button gone once applied (roles exist now)
+            self.assertFalse(screen.query_one("#free-first", tui.Button).display)
+
+    async def test_home_rows_show_probe_latency(self):
+        paths = temp_paths()
+        db = engine.load_state(paths)
+        engine.add_credentials(db, "gemini", ["GK1-FAKE"])
+        db["gemini"]["models"] = ["gemini-3.7-flash"]
+        engine._wiz.record_probe_latency(db, "gemini", "gemini-3.7-flash", 2.5)
+        engine.save_state(db, paths)
+        app = WizardApp(paths=paths, status="unknown", status_auto_refresh=False,
+                        auto_probe=False)
+        async with app.run_test(size=(100, 50)) as pilot:
+            await pilot.pause()
+            home = app.screen
+            assert isinstance(home, HomeScreen)
+            rows = home.rows
+            self.assertTrue(rows)
+            self.assertEqual(rows[0]["latency"], 2.5)
+            self.assertEqual(rows[0]["latency_txt"], "2.5s")
+
 
 class CombiningTest(unittest.IsolatedAsyncioTestCase):
     """Milestone 4: automatic combining across providers + suggested pools."""

@@ -6,7 +6,7 @@ credentials + model capabilities + quota domains + routing policy into
 LiteLLM YAML. LiteLLM remains the runtime router; this wizard is the
 control plane / configuration compiler.
 """
-__version__ = "2.4.0"
+__version__ = "2.5.0"
 SCHEMA_VERSION = 2
 import datetime
 import hashlib
@@ -267,6 +267,7 @@ ROLES_KEY = "_roles"
 QUOTA_KEY = "_quota_domains"
 SETTINGS_KEY = "_settings"
 HEALTH_KEY = "_health"
+PERF_KEY = "_performance"  # probe latency memory: "pid:model" -> {samples, ...}
 
 DEFAULT_SETTINGS = {
     "routing_preference": "balanced",  # balanced | capacity-first | reliability-first
@@ -656,16 +657,28 @@ def estimate_capacity(db, members):
 
 
 def resolve_deployment_limits(db, pid, cred, model):
-    """Limit precedence: deployment override > quota-domain > provider known
-    default > conservative default > unknown (None)."""
+    """Limit precedence: deployment override > quota-domain per-model >
+    quota-domain > provider known default > conservative default > unknown
+    (None). Google free tiers are per project+model, so a per-model
+    override on the domain beats the domain-wide number."""
     dep_over = (cred.get("limits") or {}) if isinstance(cred, dict) else {}
     qd = effective_quota_domain(pid, cred)
     q = (db.get(QUOTA_KEY) or {}).get(qd) or {}
+    per_model = q.get("per_model") if isinstance(q, dict) else None
+    pm = {}
+    if isinstance(per_model, dict):
+        cand = per_model.get(model)
+        if isinstance(cand, dict):
+            pm = cand
     meta = PROVIDER_META.get(pid) or PROVIDER_META.get("custom")
     if pid.startswith("custom_"):
         meta = PROVIDER_META.get("custom")
     rpm = dep_over.get("rpm", None)
     tpm = dep_over.get("tpm", None)
+    if rpm is None:
+        rpm = pm.get("rpm")
+    if tpm is None:
+        tpm = pm.get("tpm")
     if rpm is None:
         rpm = q.get("rpm")
     if tpm is None:
@@ -881,6 +894,43 @@ def deployment_health(db, pid, model):
     if any(s == "invalid" for s in states):
         return "invalid"
     return "unknown"
+
+
+# ---------- performance memory (probe latency, rolling window) ----------
+
+PERF_WINDOW = 5  # remembered probe latencies per (provider, model)
+
+
+def record_probe_latency(db, pid, model, seconds):
+    """Remember one probe latency (seconds) for a (provider, model).
+
+    Rolling window of the last PERF_WINDOW samples; failures and
+    non-numeric values are ignored. Never secrets — ids only.
+    """
+    if not model or not isinstance(seconds, (int, float)) or seconds < 0:
+        return
+    perf = db.setdefault(PERF_KEY, {})
+    rec = perf.get(f"{pid}:{model}")
+    if not isinstance(rec, dict):
+        rec = {"samples": []}
+    samples = [s for s in (rec.get("samples") or [])
+               if isinstance(s, (int, float)) and s > 0]
+    samples.append(round(float(seconds), 3))
+    rec["samples"] = samples[-PERF_WINDOW:]
+    rec["updated_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+    perf[f"{pid}:{model}"] = rec
+
+
+def probe_latency(db, pid, model):
+    """Mean latency (seconds) from the recent probe window, or None."""
+    rec = (db.get(PERF_KEY) or {}).get(f"{pid}:{model}")
+    if not isinstance(rec, dict):
+        return None
+    samples = [s for s in (rec.get("samples") or [])
+               if isinstance(s, (int, float)) and s > 0]
+    if not samples:
+        return None
+    return round(sum(samples) / len(samples), 3)
 
 
 # ---------- deployment compiler ----------
@@ -1966,11 +2016,16 @@ def test_models(pid, models, key, endpoint=None, keys=None, mode="FAST",
     print(f"  [*] Testing {len(models)} model(s) directly (minimal ping, {tag} {first}, {len(matrix)} probes)...")
     results = []
     for m, k, ep in matrix:
+        t0 = time.monotonic()
         cls, msg = probe_model_classified(pid, m, k, ep)
+        took = time.monotonic() - t0
         label = {"OK": "OK", "RATE_LIMITED": "WAIT"}.get(cls, "FAIL")
         extra = f" [{snippet(k)}]" if mode != "FAST" and k else ""
-        print(f"      [{label}] {m}{extra} -> {msg}")
+        lat = f" ({took:.1f}s)" if cls in ("OK", "RATE_LIMITED") else ""
+        print(f"      [{label}] {m}{extra}{lat} -> {msg}")
         results.append((m, cls, msg))
+        if cls in ("OK", "RATE_LIMITED") and db is not None:
+            record_probe_latency(db, pid, m, took)
         if db is not None and k:
             pdata = db.get(pid, {}) if isinstance(db.get(pid), dict) else {}
             cid = next((c.get("id") for c in (pdata.get("credentials") or [])
@@ -3354,6 +3409,10 @@ def manage_quota(db):
             rpm = q.get("rpm")
             print(f"  {qd:<28} {_plural(n, 'key')}" +
                   (f", about {rpm}/min" if rpm else ", speed unknown"))
+            for model, pm in sorted((q.get("per_model") or {}).items()):
+                pm_rpm = pm.get("rpm") if isinstance(pm, dict) else None
+                if pm_rpm:
+                    print(f"      model {model}: about {pm_rpm}/min")
         print("\n  [A] move keys between buckets  [C] new bucket  [R] rename  [L] set speed  [Q] back")
         try:
             ch = input("Quota choice: ").strip().lower()
@@ -3404,9 +3463,10 @@ def manage_quota(db):
                 print(f"  [!] No bucket '{qd}' (pick one from the list above).")
                 continue
             print("  [1] typical value for this provider  [2] I know the real number  "
-                  "[3] play it safe (slow)  [4] stop tracking speed")
+                  "[3] play it safe (slow)  [4] stop tracking speed\n"
+                  "      [5] one specific model (Google free tiers are per project+model)")
             try:
-                mode = input("  Choice [1/2/3/4]: ").strip()
+                mode = input("  Choice [1/2/3/4/5]: ").strip()
             except (EOFError, KeyboardInterrupt):
                 print()
                 continue
@@ -3443,6 +3503,25 @@ def manage_quota(db):
                           "confidence": "unknown", "source": "no modeling",
                           "updated_at": datetime.datetime.now().isoformat(timespec="seconds")})
                 print("  [+] Speed tracking off for this bucket.")
+            elif mode == "5":
+                # Google free-tier limits are per project+model: one model
+                # can be tighter than the project-wide number.
+                try:
+                    model = input("  Which model (exact id, e.g. gemini-3.7-flash): ").strip()
+                    rpm = input("  Requests/min for this model (empty = don't know): ").strip()
+                    tpm = input("  Tokens/min for this model (empty = don't know): ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    continue
+                if not model:
+                    continue
+                pm = q.get("per_model") if isinstance(q.get("per_model"), dict) else {}
+                pm[model] = {"rpm": int(rpm) if rpm else None,
+                             "tpm": int(tpm) if tpm else None,
+                             "updated_at": datetime.datetime.now().isoformat(timespec="seconds")}
+                q["per_model"] = pm
+                print(f"  [+] '{qd}' / {model}: about {pm[model]['rpm'] or '?'}/min"
+                      " — beats the bucket-wide number for this model.")
             save_db(db)
             continue
         if ch in ("a", "assign", "move"):
@@ -3580,6 +3659,72 @@ ROLE_PRESETS = {
     "long": {"pools": [], "fallback": [], "requires": {}},
 }
 
+# Free-first roles: ordinary work goes to Flash-class (cheap, fast),
+# stronger models stay reserved for explicit "smart" calls. Suggested
+# only when the needed pools actually exist.
+FREE_FAST_TIERS = ("flash", "lite")
+
+
+def suggest_free_first_roles(db):
+    """Suggest google-free-fast / google-free-smart when gemini pools exist.
+
+    Returns dict role -> {pools, note}. fast = flash/lite-tier pools
+    (sorted: cheaper & faster first); smart = pro/reasoning-tier pools.
+    Suggested only when missing and at least one matching pool exists.
+    Never mutates the DB.
+    """
+    try:
+        _deps, pools, _roles, _errors = compile_config(db)
+    except Exception:
+        return {}
+    gemini_pools = []
+    for pool, members in pools.items():
+        if any(str(d.get("provider") or "") == "gemini" for d in members):
+            gemini_pools.append(pool)
+    if not gemini_pools:
+        return {}
+    caps = {}
+    for pool, members in pools.items():
+        tiers = {str((d.get("capabilities") or {}).get("tier") or "unknown")
+                 for d in members if d.get("provider") == "gemini"}
+        caps[pool] = tiers
+    fast = sorted(p for p in gemini_pools if caps[p] & set(FREE_FAST_TIERS))
+    smart = sorted(p for p in gemini_pools if caps[p] & {"pro", "reasoning"})
+    roles = db.get(ROLES_KEY) or {}
+    out = {}
+    if fast and "google-free-fast" not in roles:
+        out["google-free-fast"] = {"pools": fast,
+                                   "note": "flash-class first (free quota first)"}
+    if smart and "google-free-smart" not in roles:
+        out["google-free-smart"] = {"pools": smart,
+                                    "note": "pro/reasoning for heavy lifts"}
+    return out
+
+
+def apply_free_first_roles(db):
+    """Create suggested free-first roles that don't collide with pools.
+
+    Returns (applied, skipped) role names. Only google-free-* names are
+    ever written here — user roles are never touched.
+    """
+    suggestions = suggest_free_first_roles(db)
+    roles = db.setdefault(ROLES_KEY, {})
+    pools_ok = set()
+    try:
+        _deps, pools, _r, _errors = compile_config(db)
+        pools_ok = set(pools)
+    except Exception:
+        return [], []
+    applied, skipped = [], []
+    for role, spec in suggestions.items():
+        primaries = [p for p in spec["pools"] if p in pools_ok]
+        if not primaries or role in pools_ok:
+            skipped.append(role)
+            continue
+        roles[role] = {"pools": primaries, "fallback": [], "requires": {}}
+        applied.append(role)
+    return applied, skipped
+
 
 def manage_roles(db):
     """Interactive role manager: roles point at logical pools with ordered fallback."""
@@ -3597,7 +3742,12 @@ def manage_roles(db):
             print(f"  {role:<14} -> {', '.join(spec.get('pools') or []) or '(empty)'}"
                   + (f"  (fallback: {', '.join(spec.get('fallback') or [])})" if spec.get("fallback") else ""))
         print(f"\n  Live pools: {', '.join(sorted(pools)) or '(none)'}")
-        print("  [A]dd/set  [R]emove  [Q] back")
+        free = suggest_free_first_roles(db)
+        if free:
+            for role, spec in free.items():
+                print(f"  [?] '{role}' -> {', '.join(spec['pools'])} ({spec['note']})")
+        print("  [A]dd/set  [R]emove  [F]ree-first roles"
+              + ("  [Q] back" if free else "  [Q] back"))
         try:
             ch = input("Role choice: ").strip().lower()
         except (EOFError, KeyboardInterrupt):
@@ -3605,6 +3755,19 @@ def manage_roles(db):
             break
         if ch in ("q", "quit", "back", "done", "exit", ""):
             break
+        if ch in ("f", "free", "free-first"):
+            applied, skipped = apply_free_first_roles(db)
+            if applied:
+                save_db(db)
+                print(f"  [+] Added {', '.join(applied)}.")
+                try:
+                    n = generate_yaml(db)
+                    print(f"  [+] Routes: {n}")
+                except ValueError as e:
+                    print(f"  [!] {e}")
+            else:
+                print("  [i] Nothing to add (roles exist or no matching pools).")
+            continue
         if ch in ("r", "remove"):
             try:
                 name = input("  Role to remove: ").strip()

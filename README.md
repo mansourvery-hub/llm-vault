@@ -389,6 +389,20 @@ installed LiteLLM), so `fast` tries its primary pools in order, then fallbacks.
 Strict roles (`coder`, `vision`, `reasoning`) only accept deployments with verified
 capabilities — `unknown` doesn't qualify unless you allow it.
 
+### Free-first roles: `google-free-fast`, `google-free-smart`
+
+When Google keys are configured, the wizard suggests two roles that keep free
+quota working for you:
+
+- **`google-free-fast`** — flash/lite-tier pools first: cheap, fast models for
+  ordinary work (autocomplete, quick chats).
+- **`google-free-smart`** — pro/reasoning-tier pools, reserved for heavy lifts.
+
+The idea: spend the fast free quota first and keep the strong quota in reserve.
+Accept the suggestion from Review (`Add free-first roles`) or the role manager
+(`role` → `F`); like every role they sync into `opencode.json` as
+`litellm/google-free-fast` / `litellm/google-free-smart`.
+
 ## Updating the wizard itself
 
 `litellm-add` doesn't run this repo's file — it runs a copy you installed at

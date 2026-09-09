@@ -341,6 +341,21 @@ def quota_domains_list(db: dict[str, Any]) -> list[dict[str, Any]]:
     return _wiz.quota_domains_list(db)
 
 
+def probe_latency(db: dict[str, Any], pid: str, model: str) -> float | None:
+    """Mean recent probe latency (seconds) for (provider, model), or None."""
+    return _wiz.probe_latency(db, pid, model)
+
+
+def suggest_free_first_roles(db: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Suggested google-free-fast/smart roles when gemini pools exist."""
+    return _wiz.suggest_free_first_roles(db)
+
+
+def apply_free_first_roles(db: dict[str, Any]) -> tuple[list[str], list[str]]:
+    """Create suggested free-first roles. Returns (applied, skipped)."""
+    return _wiz.apply_free_first_roles(db)
+
+
 def calculate_capacity(db: dict[str, Any], members) -> dict[str, Any]:
     """Effective capacity summed over UNIQUE quota domains (never keys x RPM)."""
     return _wiz.estimate_capacity(db, members)

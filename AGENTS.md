@@ -37,8 +37,10 @@ Key distinctions: `key != quota`, `deployment != model`, `identity != capability
   "_aliases": {"pool": [{"provider": "pid", "model": "mid"}]},
   "_roles": {"fast": {"pools": [...], "fallback": [...], "requires": {}}},
   "_quota_domains": {"google-project-a": {"rpm": 10, "tpm": null, "rpd": null,
-                      "confidence": "manual|provider_default|conservative|unknown"}},
+                      "confidence": "manual|provider_default|conservative|unknown",
+                      "per_model": {"gemini-3.7-flash": {"rpm": 5, "tpm": null}}}},
   "_health": {"pid:cred-id": {"status": "ok|throttled|invalid|unknown", ...}},
+  "_performance": {"pid:model": {"samples": [1.2, ...], "updated_at": "..."}},
   "<pid>": {"keys": [...], "credentials": [{"id": "cred-<hash>", "secret": "...",
              "label": "", "quota_domain": "...", "project_id": "", "enabled": true,
              "validation": {"status": "...", ...}}],
@@ -48,6 +50,9 @@ Key distinctions: `key != quota`, `deployment != model`, `identity != capability
 
 - `keys[]` is kept in sync for backward compat; `credentials[]` is the source of truth. Credential IDs are `cred-<sha256(secret)[:12]>` — stable across reorders, never the raw key.
 - `project_id` (additive, Google projects): keys of one project share one speed limit. `effective_quota_domain()` groups by it (`project:<pid>:<id>`) even over a stale per-credential default; `quota_domains_list()` exposes domains for the TUI dashboard.
+- `_quota_domains[qd].per_model` (Google free tiers are per project+model): limit precedence is deployment override > per-model domain > domain-wide > provider default. Shared-domain RPM splits per (domain, model).
+- `_performance` (probe latency memory): `record_probe_latency()` keeps a rolling window (last 5) per (provider, model); `probe_latency()` returns the mean. Recorded from `test_models` probes, shown in the TUI row detail; ids only, never secrets.
+- Free-first roles (`google-free-fast` = flash/lite tier, `google-free-smart` = pro/reasoning): `suggest_free_first_roles()` proposes when gemini pools exist and the role is missing; `apply_free_first_roles()` writes only `google-free-*` names (user roles untouched). Surfaces as Review button + role manager `[F]`.
 - `migrate_db()` is automatic + idempotent: legacy `_unified` -> `_aliases` (deduped), missing sections defaulted, one-credential-per-domain defaults. Never silently deletes valid config; `normalize_aliases()` cleans stale members visibly.
 - `context_window` comes from the installed litellm model map via `lookup_context_window()` (exact id strings only, lazy import) — else `unknown`, never guessed.
 - Quota semantics: Google = project-scoped (ask bulk grouping); others default to credential/account/unknown per `PROVIDER_META` (only verified facts; else `unknown`).

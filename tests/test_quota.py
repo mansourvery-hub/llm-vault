@@ -124,6 +124,40 @@ class QuotaTest(unittest.TestCase):
         w.normalize_credentials(pdata)
         self.assertEqual(pdata["credentials"][0].get("project_id"), "")
 
+    def test_per_model_quota_overrides_domain(self):
+        # Google free tiers are per project+model: a per-model override on
+        # the domain beats the domain-wide number.
+        db = db_with(keys=["K1"], domain_of=lambda k: "project:gemini:proj-a",
+                     rpm=10, models=["gemini-3.7-flash", "gemini-3.5-flash-lite"])
+        db[w.QUOTA_KEY]["project:gemini:proj-a"]["per_model"] = {
+            "gemini-3.7-flash": {"rpm": 5, "tpm": None}}
+        rpm, _ = w.resolve_deployment_limits(db, "gemini", db["gemini"]["credentials"][0],
+                                             "gemini-3.7-flash")
+        self.assertEqual(rpm, 5)  # per-model wins over domain-wide 10
+        rpm, _ = w.resolve_deployment_limits(db, "gemini", db["gemini"]["credentials"][0],
+                                             "gemini-3.5-flash-lite")
+        self.assertEqual(rpm, 10)  # no per-model entry -> domain-wide
+
+    def test_deployment_override_beats_per_model(self):
+        db = db_with(keys=["K1"], domain_of=lambda k: "d1", rpm=10)
+        db[w.QUOTA_KEY]["d1"]["per_model"] = {"gemini-3.7-flash": {"rpm": 5, "tpm": None}}
+        cred = db["gemini"]["credentials"][0]
+        cred["limits"] = {"rpm": 2}
+        rpm, _ = w.resolve_deployment_limits(db, "gemini", cred, "gemini-3.7-flash")
+        self.assertEqual(rpm, 2)
+
+    def test_per_model_split_is_per_domain_and_model(self):
+        # two models sharing one domain with per-model rpm: each model's
+        # deployments split that model's number, never the domain's
+        db = db_with(keys=["K1", "K2"], domain_of=lambda k: "d1", rpm=100,
+                     models=["m1", "m2"])
+        db[w.QUOTA_KEY]["d1"]["per_model"] = {"m1": {"rpm": 4, "tpm": None}}
+        deps, _, _, errors = w.compile_config(db)
+        self.assertEqual(errors, [])
+        m1_rpms = [d["rpm"] for d in deps if d["upstream_model"] == "m1"]
+        self.assertEqual(len(m1_rpms), 2)
+        self.assertLessEqual(sum(m1_rpms), 4)
+
 
 if __name__ == "__main__":
     unittest.main()
