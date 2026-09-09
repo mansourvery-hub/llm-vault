@@ -1,9 +1,13 @@
-# Local LLM Gateway (LiteLLM + setup wizard)
+# LLM Proxy Wizard (local LLM gateway + setup wizard)
 
 Run many AI providers (Google Gemini, OpenRouter, Z.AI, TokenRouter, Ollama…)
 through **one address on your own machine**: `http://localhost:4000`.
 Any tool that speaks the OpenAI format (OpenCode, Cline, plain scripts) can use it —
 you configure keys **once**, and every tool shares them.
+
+> Hard fork of [`litellm-wizard`](https://github.com/mansourvery-hub/litellm-wizard),
+> renamed because other proxy backends besides LiteLLM are planned. LiteLLM is the
+> current (and only) backend — everything below still runs against it.
 
 > **Jargon buster (read this first, it makes everything below click)**
 > - **Terminal / shell** — the black window where you type commands. On KDE, open it with `Ctrl+Alt+T`. Your shell is called `zsh`.
@@ -38,18 +42,18 @@ Then fetch everything (copy-paste beats retyping 1000 lines into nano):
 
 ```bash
 cd ~
-gh repo clone mansourvery-hub/litellm-wizard
-ls litellm-wizard   # wizard.py  sync-opencode.py  litellm.service  tests/  README.md
+gh repo clone mansourvery-hub/llm-proxy-wizard
+ls llm-proxy-wizard   # wizard.py  sync-opencode.py  litellm.service  tests/  README.md
 ```
 
 No `gh`? Alternatives, worst first:
 
 - **Copy-paste via nano** (`nano wizard.py`, paste, save) — works but one missed line breaks the script; only for emergencies.
 - **Browser download** — open the repo page → file → download, then move the files.
-- **`git clone https://github.com/mansourvery-hub/litellm-wizard.git`** — same as `gh repo clone`, Git will ask for your username + a
+- **`git clone https://github.com/mansourvery-hub/llm-proxy-wizard.git`** — same as `gh repo clone`, Git will ask for your username + a
   personal access token as password (your normal password won't work).
 
-All steps below assume the files sit in `~/litellm-wizard/`.
+All steps below assume the files sit in `~/llm-proxy-wizard/`.
 
 ## 1. What you need
 
@@ -70,8 +74,8 @@ sudo pacman -S --needed python python-virtualenv curl git github-cli
 mkdir -p ~/.config/litellm ~/.config/systemd/user
 
 # 3) Put the repo files into place (from section 0's clone):
-cp ~/litellm-wizard/wizard.py ~/.config/litellm/wizard.py
-cp ~/litellm-wizard/litellm.service ~/.config/systemd/user/litellm.service
+cp ~/llm-proxy-wizard/wizard.py ~/.config/litellm/wizard.py
+cp ~/llm-proxy-wizard/litellm.service ~/.config/systemd/user/litellm.service
 # Make sure the wizard is runnable directly (cp doesn't always keep the exec bit):
 chmod +x ~/.config/litellm/wizard.py
 
@@ -79,11 +83,11 @@ chmod +x ~/.config/litellm/wizard.py
 python3 -m venv ~/.config/litellm/venv
 ~/.config/litellm/venv/bin/pip install -U pip litellm pyyaml requests textual
 # Equivalent, from a clone of this repo (pins the verified versions):
-# ~/.config/litellm/venv/bin/pip install -r ~/litellm-wizard/requirements.txt
+# ~/.config/litellm/venv/bin/pip install -r ~/llm-proxy-wizard/requirements.txt
 
 # 5) Shortcuts so you can launch things by typing one word
 echo "alias litellm-add='~/.config/litellm/venv/bin/python ~/.config/litellm/wizard.py'" >> ~/.zshrc
-echo "alias litellm-tui='~/.config/litellm/venv/bin/python ~/litellm-wizard/tui.py'" >> ~/.zshrc
+echo "alias llm-proxy-wizard='~/.config/litellm/venv/bin/python ~/llm-proxy-wizard/tui.py'" >> ~/.zshrc
 source ~/.zshrc
 ```
 
@@ -124,23 +128,29 @@ systemctl --user status litellm.service --no-pager | head -n 8
 The primary interface is the terminal app:
 
 ```bash
-litellm-tui
+llm-proxy-wizard
 ```
 
-Home shows whether the gateway works, your models, and anything needing
-attention. **Configure** walks you through one provider at a time: paste
-keys → they are checked in the background → answer at most one question
-(do your keys share one usage limit?) → pick models from the live list
-(free first, type to filter) → each pick is probe-tested → **Review**
+Home is a table: one row per deployment with pool, provider, model, tier,
+rate limit (RPM), quota domain, context, health, and key suffix. A detail
+card below always describes the highlighted row; anything needing attention
+is listed underneath. **Configure** walks you through one provider at a
+time: paste keys → they are checked in the background → answer at most one
+question (do your keys share one usage limit?) → pick models from the live
+list (free first, type to filter) → each pick is probe-tested → **Review**
 shows what Apply will do. Same-model pools across providers are grouped
 automatically; uncertain ones are offered for one-confirm grouping.
 **Test** checks every model through the gateway and helps park wrong-key
-connections. **Apply** writes safely, restarts only if anything changed,
+connections. **OpenCode view** shows exactly what OpenCode sees: every
+`litellm/<alias>` grouped with its backing deployments, plus sync state.
+**Apply** writes safely, restarts only if anything changed,
 and offers the OpenCode sync.
 
-Keyboard: arrows/enter navigate lists, `c`/`t`/`v` jump on Home,
-`q` quits from Home, `Esc` goes back. No network call ever blocks the UI.
-Sanity check without the UI: `litellm-tui --check`.
+Keyboard on Home: arrows navigate, `/` filter, `s` cycle sort, `S` reverse,
+`x` clear filter, `h` hide invalid, `c`/`t`/`v`/`o` jump to
+Configure/Test/Review/OpenCode view, `q` quits, `Esc` goes back.
+No network call ever blocks the UI.
+Sanity check without the UI: `llm-proxy-wizard --check`.
 
 The classic CLI (`litellm-add`) still works unchanged and shares the same
 database — use either. What happens in the CLI, step by step:
@@ -193,8 +203,8 @@ curl -s http://localhost:4000/v1/chat/completions \
 no comma mistakes. Two ways to run it, pick one (they do exactly the same thing):
 
 ```bash
-cd ~/litellm-wizard && ./sync-opencode.py            # needs the exec bit (chmod +x)
-python3 ~/litellm-wizard/sync-opencode.py            # always works — the guide uses this form
+cd ~/llm-proxy-wizard && ./sync-opencode.py            # needs the exec bit (chmod +x)
+python3 ~/llm-proxy-wizard/sync-opencode.py            # always works — the guide uses this form
 ```
 
 (Why two spellings? `./file` relies on the file's executable permission, which can get
@@ -205,7 +215,7 @@ Want to see what it *would* do first? Add `--dry-run` — it only prints, change
 `--no-roles` syncs pools only, skipping role aliases:
 
 ```bash
-python3 ~/litellm-wizard/sync-opencode.py --dry-run
+python3 ~/llm-proxy-wizard/sync-opencode.py --dry-run
 ```
 
 So: run with `--dry-run` when you're nervous, run it plain to actually apply.
@@ -342,7 +352,7 @@ Pick the provider in the wizard → keys validate → choose from the live catal
 (minimal 1-word probe) → Q. Then **always**:
 
 ```bash
-python3 ~/litellm-wizard/sync-opencode.py   # refresh opencode.json ...
+python3 ~/llm-proxy-wizard/sync-opencode.py   # refresh opencode.json ...
 ```
 
 …**and restart the OpenCode TUI** (it only reads config at startup), then `/models`.
@@ -377,7 +387,7 @@ here), copy it over and keep the exec bit, otherwise `litellm-add` keeps using
 the old code:
 
 ```bash
-cp ~/litellm-wizard/wizard.py ~/.config/litellm/wizard.py
+cp ~/llm-proxy-wizard/wizard.py ~/.config/litellm/wizard.py
 chmod +x ~/.config/litellm/wizard.py
 ```
 
@@ -393,9 +403,9 @@ with `quota` afterwards).
 
 | Situation | Command |
 |---|---|
-| Add/remove keys or models | `litellm-tui` (Configure → Review → Apply; re-sync OpenCode if pools changed) |
+| Add/remove keys or models | `llm-proxy-wizard` (Configure → Review → Apply; re-sync OpenCode if pools changed) |
 | Same, classic CLI | `litellm-add` (Q applies + restarts; re-sync OpenCode if pools changed) |
-| Quick self-check, no UI | `litellm-tui --check` |
+| Quick self-check, no UI | `llm-proxy-wizard --check` |
 | Is it running? | `systemctl --user status litellm.service --no-pager` |
 | What broke? | `journalctl --user -u litellm.service -n 50 --no-pager` |
 | Quick self-check | `litellm-add` → `diagnose` |

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Textual TUI for litellm-wizard.
+"""Textual TUI for llm-proxy-wizard.
 
 Thin presentation layer only. All product logic (provider validation,
 quota math, config compilation, secret handling, OpenCode sync) lives in
@@ -402,7 +402,7 @@ class HomeScreen(Screen):
     def compose(self) -> ComposeResult:
         yield Header()
         with Vertical(id="body"):
-            yield Label("LiteLLM Wizard", id="title")
+            yield Label("LLM Proxy Wizard", id="title")
             yield Static("", id="gateway-badge")
             yield Input(placeholder="Filter pools/providers/models ( / to focus, x to clear )",
                         id="home-filter")
@@ -1695,7 +1695,7 @@ class DoneScreen(Screen):
 # ------------------------------------------------------------------ app ---
 
 class WizardApp(App):
-    TITLE = "LiteLLM Wizard"
+    TITLE = "LLM Proxy Wizard"
     SUB_TITLE = f"v{engine.__version__}"
     CSS = """
     #body { width: 1fr; height: auto; margin: 1 2; }

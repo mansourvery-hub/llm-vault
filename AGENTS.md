@@ -1,17 +1,18 @@
-# Agent Instructions for `litellm-wizard`
+# Agent Instructions for `llm-proxy-wizard`
 
 This document provides context, conventions, and operational workflows for AI coding agents working in this repository.
+Hard fork of `litellm-wizard`, renamed because other proxy backends besides LiteLLM are planned. LiteLLM on `localhost:4000` is the current (and only) backend.
 
 ---
 
 ## 1. Project Architecture & Structure
 
-`litellm-wizard` is a quota-aware, health-aware deployment manager for a local LiteLLM gateway (`localhost:4000`).
+`llm-proxy-wizard` is a quota-aware, health-aware deployment manager for a local LLM gateway (LiteLLM on `localhost:4000` today; other proxy backends planned).
 Mental model: **wizard = control plane / config compiler, LiteLLM = runtime router.**
 
 - **`wizard.py`** (v2.x, Python 3.10+, PyYAML): interactive CLI. Direct key validation, live catalogs, minimal model probes, quota domains, capability pools, role aliases, `config.yaml` compilation, gateway/pool tests, readiness-aware restart, OpenCode sync offer.
 - **`engine.py`** (stdlib + PyYAML via `wizard`): clean callable facade over `wizard.py`/`sync-opencode.py`. No reimplemented logic. The TUI (and future callers) drive the product through it; network/systemd adapters are mockable, paths overridable.
-- **`tui.py`** (Textual): thin presentation layer — Home/Configure/Provider/Test/Review screens only. Must never contain provider logic, quota math, compilation, secret handling, or OpenCode mutation.
+- **`tui.py`** (Textual): thin presentation layer — table-first Home dashboard (one row per deployment: pool/provider/model/tier/rpm/tpm/quota/ctx/health) + OpenCode view (exposed aliases grouped with children) + Configure/Provider/Test/Review screens only. Must never contain provider logic, quota math, compilation, secret handling, or OpenCode mutation.
 - **`sync-opencode.py`** (stdlib-only): syncs user-facing pools (+roles) into `opencode.json` as a `litellm` block. JSONC-tolerant, backup + atomic write, idempotent, `--dry-run`, never carries secrets.
 - **`tests/`**: stdlib `unittest` suite (fake keys only, mocked HTTP). Run with the venv python (system python lacks PyYAML).
 - **`litellm.service`**: systemd user service on port 4000.
@@ -116,7 +117,7 @@ chmod +x ~/.config/litellm/wizard.py
 ### Authentication & Cloning
 ```bash
 gh auth login
-gh repo clone mansourvery-hub/litellm-wizard
+gh repo clone mansourvery-hub/llm-proxy-wizard
 ```
 
 ### Commit Conventions

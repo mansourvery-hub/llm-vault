@@ -1,4 +1,4 @@
-# Verified dependency set for litellm-wizard (see README install steps).
+# Verified dependency set for llm-proxy-wizard (see README install steps).
 # litellm is pinned: the compiler's router/retry shapes are verified
 # against this exact release. textual is pinned: the TUI is tested
 # against this release.

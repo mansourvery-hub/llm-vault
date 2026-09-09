@@ -3826,7 +3826,7 @@ def main():
         print(f"Dropped {cleaned} outdated entr{'y' if cleaned == 1 else 'ies'} pointing at "
               "models you removed" + (f" ({', '.join(emptied)} now empty)" if emptied else "") + ".")
         save_db(db)
-    print(f"=== LiteLLM Wizard v{__version__} ===")
+    print(f"=== LLM Proxy Wizard v{__version__} ===")
     show_all = False
     while True:
         print_status(db, verbose=show_all)

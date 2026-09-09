@@ -1,4 +1,4 @@
-"""Clean callable engine for litellm-wizard (Milestone 1).
+"""Clean callable engine for llm-proxy-wizard (Milestone 1).
 
 The tested product logic lives in ``wizard.py`` (compiler, quota math,
 provider adapters, secret handling) and ``sync-opencode.py`` (OpenCode
