@@ -114,12 +114,17 @@ ruff check wizard.py sync-opencode.py engine.py tui.py tests/
 Only fake keys in tests; mock HTTP (`_get`/`_post`/`test_single_model`); never hit real providers from automated tests.
 
 ### Syncing the Installed Copy
-Live `litellm-add` runs from `~/.config/litellm/wizard.py`. **After every `wizard.py` change:**
+Live `litellm-add` runs from `~/.config/litellm/wizard.py`. Since v2.6.0, wizard.py's `import`/`jcode`/`opencode` commands import `engine.py`, `sync-opencode.py`, and `sync-jcode.py` from the same directory — and the `llm-proxy-wizard` shell alias runs the repo's `tui.py`, which loads the same siblings from the repo. **After any of `wizard.py`, `engine.py`, `sync-opencode.py`, `sync-jcode.py`, `tui.py` changes:**
 
 ```bash
-cp wizard.py ~/.config/litellm/wizard.py
-chmod +x ~/.config/litellm/wizard.py
+cp wizard.py engine.py sync-opencode.py sync-jcode.py tui.py ~/.config/litellm/
+chmod +x ~/.config/litellm/*.py
 ```
+
+(If the installed copy ever falls behind, its `import`/`jcode` commands fail with FileNotFoundError — run the above to fix.)
+
+### Future work (explicitly deferred, do NOT implement unprompted)
+- Proxy-to-proxy import: transferring keys/models directly from another running proxy's config (e.g. a foreign LiteLLM/New-API instance) into the wizard DB, without going through OpenCode/JCode config files.
 
 ---
 
