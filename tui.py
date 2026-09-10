@@ -244,6 +244,38 @@ def deployment_table_rows(db: dict[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
+def sync_targets_line(db: dict[str, Any], paths) -> str:
+    """One-line 'Sync targets' summary: LiteLLM / OpenCode / JCode.
+
+    Read-only facts (never writes): gateway YAML state, OpenCode block
+    staleness, JCode detection + staleness. JCode absent -> 'not
+    installed', everything else still works.
+    """
+    import os as _os
+    parts = []
+    if _os.path.exists(paths.yaml_file):
+        parts.append("LiteLLM ✓")
+    else:
+        parts.append("LiteLLM — no config yet")
+    if _os.path.exists(paths.opencode_json):
+        parts.append("OpenCode " + ("✓" if not engine.opencode_differs(paths)
+                                   else "(stale)"))
+    else:
+        parts.append("OpenCode — no config")
+    try:
+        st = engine.jcode_status(paths)
+    except Exception:  # noqa: BLE001 -- detection never breaks Home
+        st = {"installed": False, "config_exists": False}
+    if not st.get("installed") and not st.get("config_exists"):
+        parts.append("JCode — not installed")
+    elif st.get("managed_profile"):
+        parts.append("JCode " + ("✓" if not engine.jcode_differs(paths)
+                                 else "(stale)"))
+    else:
+        parts.append("JCode — no managed profile yet")
+    return "  ".join(parts)
+
+
 def row_key_for(row: dict[str, Any]) -> str:
     """Stable table row identity across sorts/filters (never positional)."""
     return "\x00".join((row.get("pool", ""), row.get("provider", ""),
@@ -521,7 +553,8 @@ class HomeScreen(Screen):
     BINDINGS = [  # noqa: RUF012 -- Textual API
         ("c", "configure", "Configure"), ("t", "test", "Test"),
         ("v", "review", "Review"), ("o", "opencode", "OpenCode"),
-        ("u", "quota", "Quota"),
+        ("u", "quota", "Quota"), ("j", "jcode", "JCode"),
+        ("i", "import", "Import"),
         ("slash", "focus_filter", "Filter"),
         ("s", "cycle_sort", "Sort"), ("S", "reverse_sort", "Reverse"),
         ("T", "cycle_tier", "Tier"), ("P", "probe_all", "Probe"),
@@ -550,6 +583,7 @@ class HomeScreen(Screen):
         with Vertical(id="body"):
             yield Label("LLM Proxy Wizard", id="title")
             yield Static("", id="gateway-badge")
+            yield Static("", id="sync-targets")
             yield Input(placeholder="Filter pools/providers/models ( / to focus, x to clear )",
                         id="home-filter")
             yield DataTable(id="models-table", cursor_type="row")
@@ -563,6 +597,8 @@ class HomeScreen(Screen):
             yield Button("Test", id="go-test")
             yield Button("Review", id="go-review")
             yield Button("Quota", id="go-quota")
+            yield Button("JCode", id="go-jcode")
+            yield Button("Import", id="go-import")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -577,7 +613,6 @@ class HomeScreen(Screen):
         # per credential (skipped when everything already reported).
         if app.auto_probe and any(r["health"] == "unknown" for r in self.rows):
             self.action_probe_all()
-
     def on_screen_resume(self) -> None:
         self.refresh_content()
         self._focus_table()
@@ -602,6 +637,8 @@ class HomeScreen(Screen):
              *([f"! {a}" for a in attention] if attention else [])])
         try:
             self.query_one("#gateway-badge", Static).update(badge)
+            self.query_one("#sync-targets", Static).update(
+                sync_targets_line(app.db, app.paths))
             self.query_one("#home-attention", Static).update(attn_txt)
             self._show_probe_buttons()
         except NoMatches:  # not yet mounted
@@ -763,6 +800,12 @@ class HomeScreen(Screen):
     def action_quota(self) -> None:
         self.app.push_screen(QuotaDashboardScreen())
 
+    def action_jcode(self) -> None:
+        self.app.push_screen(JCodeScreen())
+
+    def action_import(self) -> None:
+        self.app.push_screen(ImportScreen())
+
     def action_focus_filter(self) -> None:
         try:
             self.query_one("#home-filter", Input).focus()
@@ -904,6 +947,14 @@ class HomeScreen(Screen):
     @on(Button.Pressed, "#go-quota")
     def _go_quota(self) -> None:
         self.action_quota()
+
+    @on(Button.Pressed, "#go-jcode")
+    def _go_jcode(self) -> None:
+        self.action_jcode()
+
+    @on(Button.Pressed, "#go-import")
+    def _go_import(self) -> None:
+        self.action_import()
 
 
 class ModelDetailScreen(Screen):
@@ -2282,6 +2333,210 @@ class QuotaDashboardScreen(Screen):
         self.action_back()
 
 
+class JCodeScreen(Screen):
+    """JCode target: detection status + managed profile + Sync.
+
+    Read-only view over the wizard DB + ~/.jcode/config.toml (writes only
+    happen via the Sync button, which drives :func:`engine.sync_jcode`
+    with its backup/atomic/verify guarantees). ``j`` on Home opens it.
+    """
+
+    BINDINGS = [("escape", "back", "Back"),  # noqa: RUF012 -- Textual API
+                ("r", "refresh", "Refresh"),
+                ("s", "sync", "Sync")]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.last_status = ""
+        self.data: dict[str, Any] = {}
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with Vertical(id="body"):
+            yield Label("JCode — same gateway models, TOML target", id="title")
+            yield Static("", id="jcode-status")
+            yield Tree("llm-proxy-wizard", id="jcode-tree")
+            yield Button("Sync JCode", id="sync-jcode")
+            yield Button("Back", id="back")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.refresh_content()
+
+    def on_screen_resume(self) -> None:
+        self.refresh_content()
+
+    def refresh_content(self) -> None:
+        app = self.app
+        assert isinstance(app, WizardApp)
+        try:
+            self.data = engine.jcode_status(app.paths)
+        except Exception:  # noqa: BLE001 -- status screen must not crash
+            self.data = {}
+        st = self.data
+        lines = []
+        lines.append(f"Installed: {'yes' if st.get('installed') else 'no'}"
+                     + (f" (v{st['version']})" if st.get("version") else ""))
+        lines.append(f"Config: {st.get('config', '?')}"
+                     + ("" if st.get("config_exists") else " (not found)"))
+        if st.get("config_exists") and not st.get("parseable"):
+            lines.append("Config: NOT parseable (fix before sync)")
+        if st.get("profiles"):
+            profs = ", ".join(st["profiles"])
+            lines.append(f"Profiles: {profs}")
+            lines.append("Managed profile: "
+                         + ("yes" if st.get("managed_profile") else "not yet"))
+        self.last_status = "\n".join(lines)
+        try:
+            self.query_one("#jcode-status", Static).update(self.last_status)
+            self._rebuild_tree()
+        except NoMatches:  # not yet mounted
+            pass
+
+    def _rebuild_tree(self) -> None:
+        app = self.app
+        assert isinstance(app, WizardApp)
+        try:
+            sync = engine._load_sync_module()
+            aliases, roles, _src = sync.load_aliases(app.paths.yaml_file)
+        except Exception:  # noqa: BLE001 -- no gateway config yet
+            aliases, roles = [], []
+        exposed = list(aliases) + [r for r in roles if r not in aliases]
+        tree = self.query_one("#jcode-tree", Tree)
+        tree.clear()
+        tree.root.label = (f"llm-proxy-wizard — {len(exposed)} logical model(s)"
+                           f" @ http://localhost:4000/v1")
+        for m in exposed:
+            tree.root.add_leaf(m)
+        if not exposed:
+            tree.root.add_leaf("(apply the gateway config first)")
+        tree.root.expand_all()
+
+    def action_refresh(self) -> None:
+        self.refresh_content()
+
+    @on(Button.Pressed, "#sync-jcode")
+    def _sync(self) -> None:
+        self.action_sync()
+
+    def action_sync(self) -> None:
+        app = self.app
+        assert isinstance(app, WizardApp)
+        try:
+            result = _quiet_call(engine.sync_jcode, app.paths)
+        except FileNotFoundError as e:
+            note = f"Sync failed ({e})."
+        except ValueError as e:
+            note = f"Sync failed ({e})."
+        else:
+            note = (f"JCode updated ({len(result.get('models', []))} model(s)). "
+                    "Unrelated JCode settings untouched.")
+        self.refresh_content()
+        self.last_status += f"\n{note}"
+        try:
+            self.query_one("#jcode-status", Static).update(self.last_status)
+        except NoMatches:
+            pass
+
+    def action_back(self) -> None:
+        self.app.pop_screen()
+
+    @on(Button.Pressed, "#back")
+    def _back(self) -> None:
+        self.action_back()
+
+
+class ImportScreen(Screen):
+    """Explicit one-shot imports: OpenCode -> Wizard, JCode -> Wizard.
+
+    The wizard becomes the normalized source of truth after import;
+    exports stay explicit (never a background daemon). ``i`` on Home.
+    """
+
+    BINDINGS = [("escape", "back", "Back")]  # noqa: RUF012 -- Textual API
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.last_status = "Adopt an existing client config into the wizard.\n" \
+                           "Secrets are stored as credentials and never shown."
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with Vertical(id="body"):
+            yield Label("Import client configuration", id="title")
+            yield Static("", id="import-status")
+            yield Button("Import from OpenCode", id="import-opencode",
+                         variant="primary")
+            yield Button("Import from JCode", id="import-jcode")
+            yield Button("Back", id="back")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self._render_status()
+
+    def on_screen_resume(self) -> None:
+        self._render_status()
+
+    def _render_status(self) -> None:
+        try:
+            self.query_one("#import-status", Static).update(self.last_status)
+        except NoMatches:
+            pass
+
+    @on(Button.Pressed, "#import-opencode")
+    def _import_opencode(self) -> None:
+        app = self.app
+        assert isinstance(app, WizardApp)
+        try:
+            result = _quiet_call(engine.import_opencode, app.db, app.paths)
+        except Exception as e:  # noqa: BLE001 -- report, don't crash
+            self.last_status = f"Import failed ({str(e)[:100]})"
+        else:
+            if result.get("gateway_models"):
+                note = (f"OpenCode already uses the wizard gateway "
+                        f"({len(result['gateway_models'])} model(s)) — nothing to import.")
+            elif result.get("providers"):
+                names = [p.get("name", "?") for p in result["providers"]]
+                note = (f"Imported {len(names)} provider(s): {', '.join(names)}. "
+                        "Validate keys on their provider screens, then Apply.")
+                engine.save_state(app.db, app.paths)
+                app.db = engine.load_state(app.paths)
+            else:
+                note = "No direct providers with models found."
+            self.last_status = note
+        self._render_status()
+
+    @on(Button.Pressed, "#import-jcode")
+    def _import_jcode(self) -> None:
+        app = self.app
+        assert isinstance(app, WizardApp)
+        try:
+            result = _quiet_call(engine.import_jcode, app.db, app.paths)
+        except Exception as e:  # noqa: BLE001 -- report, don't crash
+            self.last_status = f"Import failed ({str(e)[:100]})"
+        else:
+            if result.get("managed_models"):
+                note = (f"JCode already uses the wizard gateway profile "
+                        f"({len(result['managed_models'])} model(s)) — not re-imported.")
+            elif result.get("providers"):
+                names = [p.get("name", "?") for p in result["providers"]]
+                note = (f"Imported {len(names)} provider(s): {', '.join(names)}. "
+                        "Validate keys on their provider screens, then Apply.")
+                engine.save_state(app.db, app.paths)
+                app.db = engine.load_state(app.paths)
+            else:
+                note = "No custom provider profiles with models found."
+            self.last_status = note
+        self._render_status()
+
+    def action_back(self) -> None:
+        self.app.pop_screen()
+
+    @on(Button.Pressed, "#back")
+    def _back(self) -> None:
+        self.action_back()
+
+
 # ------------------------------------------------------------------ app ---
 
 class WizardApp(App):
@@ -2293,6 +2548,9 @@ class WizardApp(App):
     #gateway-badge { text-style: bold; margin-bottom: 1; }
     #home-content, #test-status, #test-results, #done-content { margin-bottom: 1; }
     #home-attention, #opencode-status { margin: 1 0; }
+    #sync-targets { margin-bottom: 1; color: $text-muted; }
+    #jcode-status, #import-status { margin-bottom: 1; }
+    #jcode-tree { height: 10; margin-bottom: 1; }
     #home-filter { margin-bottom: 1; }
     #home-hint { margin-bottom: 1; }
     #models-table { height: 14; margin-bottom: 1; }

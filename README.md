@@ -264,6 +264,89 @@ List only the aliases you actually use — each becomes `litellm/<alias>` in Ope
   (`opencode/...`) work **only** inside OpenCode (they need its session protocol),
   so don't route those through LiteLLM.
 
+## 7b. Use it in JCode
+
+The wizard can manage the same LiteLLM-backed models for **both** OpenCode and
+[JCode](https://jcode.sh). Configure once in the wizard, then choose which client
+you run:
+
+```
+                ┌──→ OpenCode (opencode.json)
+                │
+Wizard ─────────┤
+                ├──→ JCode (~/.jcode/config.toml)
+                │
+                └──→ LiteLLM → all providers
+```
+
+Sync the wizard's logical models into JCode's config:
+
+```bash
+python3 ~/llm-proxy-wizard/sync-jcode.py            # or --dry-run first
+python3 ~/llm-proxy-wizard/sync-jcode.py --print    # show the managed TOML block
+```
+
+This writes (or refreshes) a managed provider profile in `~/.jcode/config.toml`:
+
+```toml
+[provider]
+default_provider = "llm-proxy-wizard"
+default_model = "fast"
+
+[providers.llm-proxy-wizard]
+type = "openai-compatible"
+base_url = "http://localhost:4000/v1"
+api_key_env = "LITELLM_MASTER_KEY"
+default_model = "fast"
+
+[[providers.llm-proxy-wizard.models]]
+id = "fast"
+```
+
+JCode talks to the same local gateway OpenCode does — it never sees your raw
+provider keys, quota domains, or deployment details (auth is the
+`LITELLM_MASTER_KEY` env reference). Use it with:
+
+```bash
+jcode --provider-profile llm-proxy-wizard
+```
+
+Safety mirrors `sync-opencode.py`: timestamped backup, atomic write, re-parse
+verification (restores the backup on failure), only the managed
+`[providers.llm-proxy-wizard]` block is touched — your theme, keybindings,
+agents, hooks, and custom providers stay byte-for-byte identical. If you
+hand-edited the managed block since the last sync, the script refuses and tells
+you (`--overwrite-external` to force, or import first). Extra flags:
+`--jcode <path>` (custom config location), `--no-roles` (pools only),
+`--keep-default` (don't touch `[provider]` defaults).
+
+### Import existing client configs into the wizard
+
+Already have providers configured in OpenCode or JCode? Adopt them instead of
+re-typing:
+
+```bash
+# interactive, inside the wizard:
+litellm-add
+# then:  import          (adopt OpenCode providers)
+#        jcode import    (adopt JCode provider profiles)
+
+# or one-shot:
+python3 wizard.py --import-opencode
+python3 wizard.py --import-jcode
+```
+
+Imports are idempotent (running twice never duplicates providers), never
+re-import the wizard's own gateway block when OpenCode/JCode already point at
+it, store any found secrets as normal wizard credentials (never printed), and
+never touch unrelated client settings. After importing, validate the keys on the
+provider screens, then `Q` to compile, then re-sync whichever client you use.
+
+In the TUI: `j` opens the JCode screen (detection status + Sync), `i` opens the
+Import screen (OpenCode / JCode), and the Home header shows a one-line
+sync-targets summary (`LiteLLM ✓ · OpenCode ✓ · JCode ✓`). JCode being absent
+changes nothing — the line just says `JCode — not installed`.
+
 ## 8. Use it with anything else
 
 Any OpenAI-compatible tool just needs two values:
@@ -278,7 +361,7 @@ export OPENAI_API_KEY="$LITELLM_MASTER_KEY"
 # Part B — Future tweaks (come back here, skip Part A)
 
 Setup is done — everything below reuses it. The rhythm is always:
-**wizard (`litellm-add`) → Q to apply → re-sync OpenCode if pools changed.**
+**wizard (`litellm-add`) → Q to apply → re-sync OpenCode/JCode if pools changed.**
 
 ## Wizard commands (cheat sheet)
 
@@ -292,6 +375,9 @@ Setup is done — everything below reuses it. The rhythm is always:
 | `plan` | dry-run: show deployment/pool/role diff, change nothing |
 | `diagnose` | actionable checks: schema, stale aliases, quota, YAML, service, secrets |
 | `pools` / `health` | compiled pool overview / deployment health test |
+| `import` | adopt an existing OpenCode provider config into the wizard |
+| `jcode` | sync logical models into `~/.jcode/config.toml` (`jcode import` adopts an existing JCode config) |
+| `opencode` | sync logical models into `opencode.json` |
 | `T` | **gateway smoke test** — one request per alias through LiteLLM |
 | `P` | **pool test** — each underlying deployment directly (asks first when many) |
 | `F` | **full sweep** — DB consistency + pool test + gateway test |
@@ -448,6 +534,7 @@ with `quota` afterwards).
 | `tui.py` | Terminal app: Home/Configure/Test/Review screens (needs `textual`) | No |
 | `requirements.txt` | Pinned, verified dependency set (`litellm`, `textual`, `pyyaml`, `requests`) | No |
 | `sync-opencode.py` | Writes gateway pools (+roles) into `opencode.json` (backup + `--dry-run`) | No |
+| `sync-jcode.py` | Writes gateway pools (+roles) into `~/.jcode/config.toml` (backup + `--dry-run`, managed block only) | No |
 | `tests/` | Automated suite (`python -m unittest discover -s tests`, venv python) | No (fake keys only) |
 | `litellm.service` | systemd unit that runs the gateway on port 4000 | No |
 | `README.md` | This guide | No |

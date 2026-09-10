@@ -33,6 +33,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -67,6 +68,9 @@ class EnginePaths:
     yaml_file: str = dataclasses.field(default_factory=lambda: _default_paths()[1])
     secret_file: str = dataclasses.field(default_factory=lambda: _default_paths()[2])
     opencode_json: str = dataclasses.field(default_factory=lambda: _default_paths()[3])
+    jcode_config: str = dataclasses.field(default_factory=lambda: os.environ.get(
+        "JCODE_CONFIG",
+        os.path.join(os.path.expanduser("~"), ".jcode", "config.toml")))
 
     @classmethod
     def from_env(cls) -> EnginePaths:
@@ -74,12 +78,14 @@ class EnginePaths:
         return cls(db_file=db, yaml_file=yml, secret_file=sec, opencode_json=oc)
 
     @classmethod
-    def temp(cls, tmpdir: str, opencode: str | None = None) -> EnginePaths:
+    def temp(cls, tmpdir: str, opencode: str | None = None,
+             jcode: str | None = None) -> EnginePaths:
         return cls(
             db_file=os.path.join(tmpdir, "providers_db.json"),
             yaml_file=os.path.join(tmpdir, "config.yaml"),
             secret_file=os.path.join(tmpdir, ".master_key"),
             opencode_json=opencode or os.path.join(tmpdir, "opencode.json"),
+            jcode_config=jcode or os.path.join(tmpdir, "jcode_config.toml"),
         )
 
 
@@ -829,6 +835,246 @@ def opencode_differs(paths: EnginePaths | None = None) -> bool:
         return current != exposed
     except Exception:  # noqa: BLE001 -- unreadable config conservatively counts as stale
         return True
+
+
+# ------------------------------------------------------------------ jcode ---
+
+def _load_jcode_module():
+    here = os.path.dirname(os.path.abspath(__file__))
+    for cand in (os.path.join(here, "sync-jcode.py"), "sync-jcode.py"):
+        if os.path.exists(cand):
+            spec = importlib.util.spec_from_file_location("sync_jcode", cand)
+            if spec and spec.loader:
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                return mod
+    raise FileNotFoundError("sync-jcode.py not found next to engine.py")
+
+
+def jcode_status(paths: EnginePaths | None = None) -> dict[str, Any]:
+    """JCode detection facts for the TUI: binary, config, managed profile.
+
+    Read-only; never raises. ``installed`` = the jcode binary resolves on
+    PATH (jcode remains optional for everything else in the wizard).
+    """
+    p = _resolve_paths(paths)
+    out = {"installed": False, "version": "", "config": p.jcode_config,
+           "config_exists": False, "parseable": False,
+           "managed_profile": False, "profiles": []}
+    import shutil as _sh
+    binary = _sh.which("jcode")
+    if binary:
+        out["installed"] = True
+        try:
+            import subprocess as _sp
+            r = _sp.run(["jcode", "version"], capture_output=True, text=True,
+                        timeout=10, check=False)
+            m = re.search(r"semver\s+(\S+)", r.stdout or "")
+            out["version"] = m.group(1) if m else (r.stdout or "").strip()[:20]
+        except Exception as e:  # noqa: BLE001 -- detection must never fail
+            out["version"] = f"? ({str(e)[:30]})"
+    if not os.path.exists(p.jcode_config):
+        return out
+    out["config_exists"] = True
+    try:
+        syncj = _load_jcode_module()
+        with open(p.jcode_config) as f:
+            text = f.read()
+        profiles = syncj.parse_profiles(text)
+        out["profiles"] = sorted(profiles)
+        out["managed_profile"] = syncj.MANAGED_PROFILE in profiles
+        out["parseable"] = syncj.verify_toml(text) is None
+    except Exception:  # noqa: BLE001, S110 -- unreadable config is shown as such
+        pass
+    return out
+
+
+def sync_jcode(paths: EnginePaths | None = None, dry_run: bool = False,
+               include_roles: bool = True,
+               overwrite_external: bool = False) -> dict[str, Any]:
+    """Sync gateway pools (+roles) into JCode's config.toml.
+
+    Model NAMES only, never secrets; backup + atomic write + TOML
+    re-verification with restore on failure (same guarantees as the
+    script). Only the managed ``[providers.llm-proxy-wizard]`` block is
+    touched — every other JCode section survives unchanged.
+    """
+    p = _resolve_paths(paths)
+    syncj = _load_jcode_module()
+    return syncj.sync(p.jcode_config, p.yaml_file, dry_run=dry_run,
+                      print_block=False, include_roles=include_roles,
+                      set_default=True,
+                      overwrite_externally_changed=overwrite_external)
+
+
+def jcode_differs(paths: EnginePaths | None = None) -> bool:
+    """True when JCode's managed profile is stale vs the gateway."""
+    p = _resolve_paths(paths)
+    try:
+        syncj = _load_jcode_module()
+        sync = _load_sync_module()
+        aliases, roles, _ = sync.load_aliases(p.yaml_file)
+        exposed = list(aliases) + [r for r in roles if r not in aliases]
+        if not exposed:
+            return True
+        with open(p.jcode_config) as f:
+            text = f.read()
+        profiles = syncj.parse_profiles(text)
+        prof = profiles.get(syncj.MANAGED_PROFILE)
+        if not prof:
+            return True
+        return ([m.get("id") for m in prof.get("models", [])] != exposed)
+    except Exception:  # noqa: BLE001 -- unreadable config conservatively counts as stale
+        return True
+
+
+def import_provider_profile(db: dict[str, Any], name: str, base_url: str,
+                            models: list[str],
+                            api_key_env: str | None = None,
+                            api_key: str | None = None) -> dict[str, Any]:
+    """Idempotent import of one external provider profile into the DB.
+
+    Stable identity: the wizard slot is chosen by base URL first, then by
+    normalized name — so importing the same profile twice never creates
+    ``custom_import-1``, ``custom_import-2``, ... Sources: JCode profiles
+    and OpenCode direct providers alike. Secrets are stored through the
+    normal credential mechanism (never printed); ``api_key_env`` is kept
+    as a label hint only. Returns what happened per call.
+    """
+    if not base_url:
+        return {"pid": None, "created": False, "note": "no base_url"}
+    url = (base_url or "").strip().rstrip("/")
+    pid = None
+    # 1. match an existing custom slot by base_url (strong identity)
+    for cand, entry in db.items():
+        if ((cand == "custom" or cand.startswith("custom_"))
+                and isinstance(entry, dict)
+                and (entry.get("base_url") or "").rstrip("/") == url):
+            pid = cand
+            break
+    # 2. match by normalized name (stable custom_<slug>)
+    slug_pid = _wiz._custom_id(name)
+    if pid is None and isinstance(db.get(slug_pid), dict):
+        pid = slug_pid
+    created = pid is None
+    if created:
+        pid = slug_pid if slug_pid != "custom" else "custom_import"
+    entry = db.setdefault(pid, {"keys": [], "models": [], "endpoints": []})
+    entry["base_url"] = url
+    entry["label"] = name
+    if api_key and api_key not in (entry.get("keys") or []):
+        entry.setdefault("keys", []).append(api_key)
+        _wiz.normalize_credentials(entry)
+    # 3. models: union, never replace (import must not lose wizard models)
+    have = list(entry.get("models") or [])
+    new_models = [m for m in models
+                  if isinstance(m, str) and m and m not in have]
+    entry["models"] = have + new_models
+    return {"pid": pid, "created": created, "new_models": new_models,
+            "total_models": len(entry["models"]),
+            "base_url": url}
+
+
+def import_opencode(db: dict[str, Any],
+                    paths: EnginePaths | None = None) -> dict[str, Any]:
+    """Import provider/model config from opencode.json into the DB.
+
+    Case A — an existing ``provider.litellm`` block pointing at the local
+    gateway is detected and NOT re-imported (OpenCode is already a target
+    of the wizard; only its logical models are reported). Case B — direct
+    OpenAI-compatible providers (baseURL/apiKey/models) are imported
+    idempotently via :func:`import_provider_profile`. Unrelated OpenCode
+    settings are ignored. Secrets are stored via the credential
+    mechanism; masked in the returned report, never printed here.
+    """
+    p = _resolve_paths(paths)
+    if not os.path.exists(p.opencode_json):
+        return {"ok": False, "note": f"not found: {p.opencode_json}",
+                "providers": [], "gateway_models": []}
+    sync = _load_sync_module()
+    with open(p.opencode_json) as f:
+        raw = f.read()
+    try:
+        cfg = json.loads(sync._strip_jsonc(raw))
+    except json.JSONDecodeError as e:
+        return {"ok": False, "note": f"malformed: {e}",
+                "providers": [], "gateway_models": []}
+    providers = cfg.get("provider")
+    if not isinstance(providers, dict):
+        return {"ok": True, "note": "no provider block",
+                "providers": [], "gateway_models": []}
+    imported: list[dict[str, Any]] = []
+    gateway_models: list[str] = []
+    local_gw = ("localhost:4000", "127.0.0.1:4000", "0.0.0.0:4000")
+    for pid, block in providers.items():
+        if not isinstance(block, dict):
+            continue
+        opts = block.get("options") if isinstance(block.get("options"), dict) else {}
+        base = str(opts.get("baseURL") or "").strip().rstrip("/")
+        models = [m for m in (block.get("models") or {}) if isinstance(m, str)] \
+            if isinstance(block.get("models"), dict) else \
+            [m for m in (block.get("models") or []) if isinstance(m, str)]
+        if any(host in base for host in local_gw):
+            # already downstream of the wizard's gateway
+            gateway_models = models
+            continue
+        if not base or not models:
+            continue
+        api_key = str(opts.get("apiKey") or "").strip()
+        env_ref = None
+        m = re.match(r"^\{env:([A-Za-z0-9_]+)\}$", api_key)
+        if m:
+            env_ref = m.group(1)
+            api_key = os.environ.get(env_ref) or ""  # resolve silently if present
+        res = import_provider_profile(db, pid, base, models,
+                                      api_key_env=env_ref,
+                                      api_key=api_key or None)
+        res["name"] = pid
+        imported.append(res)
+    return {"ok": True, "note": "", "providers": imported,
+            "gateway_models": gateway_models}
+
+
+def import_jcode(db: dict[str, Any],
+                 paths: EnginePaths | None = None) -> dict[str, Any]:
+    """Import provider profiles from JCode's config.toml into the DB.
+
+    The wizard-managed profile (llm-proxy-wizard -> localhost gateway) is
+    detected and skipped — it IS the export target, not a real upstream.
+    Every other named OpenAI-compatible profile (custom gateways) is
+    imported idempotently via :func:`import_provider_profile`.
+    """
+    p = _resolve_paths(paths)
+    if not os.path.exists(p.jcode_config):
+        return {"ok": False, "note": f"not found: {p.jcode_config}",
+                "providers": [], "managed_models": []}
+    syncj = _load_jcode_module()
+    try:
+        with open(p.jcode_config) as f:
+            text = f.read()
+        if syncj.verify_toml(text) is not None:
+            return {"ok": False, "note": "config.toml is not parseable TOML",
+                    "providers": [], "managed_models": []}
+        profiles = syncj.parse_profiles(text)
+    except Exception as e:  # noqa: BLE001 -- malformed config reported, not raised
+        return {"ok": False, "note": f"malformed: {e}",
+                "providers": [], "managed_models": []}
+    imported: list[dict[str, Any]] = []
+    managed_models: list[str] = []
+    for name, prof in profiles.items():
+        if name == syncj.MANAGED_PROFILE:
+            managed_models = [m.get("id") for m in prof.get("models", [])
+                              if m.get("id")]
+            continue
+        base = prof.get("base_url")
+        models = [m.get("id") for m in prof.get("models", []) if m.get("id")]
+        if not base or not models:
+            continue
+        res = import_provider_profile(db, name, str(base), models)
+        res["name"] = name
+        imported.append(res)
+    return {"ok": True, "note": "", "providers": imported,
+            "managed_models": managed_models}
 
 
 def sha256_file(path: str) -> str:

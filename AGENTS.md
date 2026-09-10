@@ -8,15 +8,28 @@ Hard fork of `litellm-wizard`, renamed because other proxy backends besides Lite
 ## 1. Project Architecture & Structure
 
 `llm-proxy-wizard` is a quota-aware, health-aware deployment manager for a local LLM gateway (LiteLLM on `localhost:4000` today; other proxy backends planned).
-Mental model: **wizard = control plane / config compiler, LiteLLM = runtime router.**
+Mental model: **wizard = control plane / config compiler, LiteLLM = runtime router, OpenCode + JCode = output targets (never the source of truth).**
 
-- **`wizard.py`** (v2.x, Python 3.10+, PyYAML): interactive CLI. Direct key validation, live catalogs, minimal model probes, quota domains, capability pools, role aliases, `config.yaml` compilation, gateway/pool tests, readiness-aware restart, OpenCode sync offer.
-- **`engine.py`** (stdlib + PyYAML via `wizard`): clean callable facade over `wizard.py`/`sync-opencode.py`. No reimplemented logic. The TUI (and future callers) drive the product through it; network/systemd adapters are mockable, paths overridable.
-- **`tui.py`** (Textual): thin presentation layer — table-first Home dashboard (one row per deployment: pool/provider/model/tier/quota/status, click-header sort, tier filter, auto-probe on mount + `P` re-probe, Enter/click row-detail modal with per-credential probe + gateway test; ctx shown in modal only when the litellm map knows it) + OpenCode view (exposed aliases grouped with children) + Quota dashboard (`u`/button: one row per quota domain — keys/RPM/project/confidence via `engine.quota_domains_list`) + Configure/Provider/Test/Review screens only. Must never contain provider logic, quota math, compilation, secret handling, or OpenCode mutation.
+```
+                ┌──→ LiteLLM config (config.yaml)
+                │
+Wizard DB/Model ├──→ OpenCode config (opencode.json, managed "litellm" block)
+                │
+                └──→ JCode config (~/.jcode/config.toml, managed provider profile)
+```
+
+- **`wizard.py`** (v2.x, Python 3.10+, PyYAML): interactive CLI. Direct key validation, live catalogs, minimal model probes, quota domains, capability pools, role aliases, `config.yaml` compilation, gateway/pool tests, readiness-aware restart, OpenCode/JCode sync offers, explicit OpenCode/JCode imports (`import`, `jcode import`, `--import-opencode`, `--import-jcode`, `--sync-jcode`, `--sync-opencode`).
+- **`engine.py`** (stdlib + PyYAML via `wizard`): clean callable facade over `wizard.py`/`sync-opencode.py`/`sync-jcode.py`. No reimplemented logic. The TUI (and future callers) drive the product through it; network/systemd adapters are mockable, paths overridable (`EnginePaths.jcode_config` honours `JCODE_CONFIG`).
+- **`tui.py`** (Textual): thin presentation layer — table-first Home dashboard (one row per deployment: pool/provider/model/tier/quota/status, click-header sort, tier filter, auto-probe on mount + `P` re-probe, Enter/click row-detail modal with per-credential probe + gateway test; ctx shown in modal only when the litellm map knows it; one-line sync-targets summary) + OpenCode view (`o`) + JCode view (`j`: detection + managed profile + Sync via `engine.sync_jcode`) + Import screen (`i`: OpenCode/JCode → Wizard via `engine.import_*`) + Quota dashboard (`u`) + Configure/Provider/Test/Review screens only. Must never contain provider logic, quota math, compilation, secret handling, or OpenCode/JCode mutation.
 - **`sync-opencode.py`** (stdlib-only): syncs user-facing pools (+roles) into `opencode.json` as a `litellm` block. JSONC-tolerant, backup + atomic write, idempotent, `--dry-run`, never carries secrets.
-- **`tests/`**: stdlib `unittest` suite (fake keys only, mocked HTTP). Run with the venv python (system python lacks PyYAML).
+- **`sync-jcode.py`** (stdlib-only, incl. a minimal TOML-subset parser/writer): syncs the same pools (+roles) into JCode v0.84+'s `~/.jcode/config.toml` as a managed `[providers.llm-proxy-wizard]` profile (`type="openai-compatible"`, `base_url=http://localhost:4000/v1`, `api_key_env=LITELLM_MASTER_KEY`, `[[...models]]` arrays, `[provider]` defaults). Only the managed span + the two default fields are touched — all other JCode sections survive byte-for-byte. Backup + atomic write + re-parse verification with restore; `managed_hash` stamp detects external edits (blocked by default, `--overwrite-external` forces). Idempotent, `--dry-run`, `--print`, `--jcode <path>`, `--no-roles`, `--keep-default`. Never carries secrets.
+- **`tests/`**: stdlib `unittest` suite (fake keys only, mocked HTTP; JCode/OpenCode paths always temp-dir overrides). Run with the venv python (system python lacks PyYAML).
 - **`litellm.service`**: systemd user service on port 4000.
 - **`README.md`**: user-facing guide + jargon buster.
+
+### Imports (explicit one-shots, never a daemon)
+
+`engine.import_opencode` (Case A: an existing `provider.litellm` block at localhost:4000 is detected and NOT re-imported, only reported; Case B: direct providers imported as `custom_<slug>` slots) and `engine.import_jcode` (skips the managed profile; imports other named profiles). Both are idempotent — stable identity by base_url first, then normalized name; models union, never replace; secrets go through the credential mechanism and are never printed.
 
 ### Internal hierarchy
 
@@ -76,7 +89,7 @@ Stages: migrate/normalize -> credentials -> quota -> model metadata -> deploymen
 
 ### Python Environment
 - Wizard/tests: `~/.config/litellm/venv/bin/python` (has PyYAML + litellm).
-- `sync-opencode.py`: system `python3` is fine (stdlib only).
+- `sync-opencode.py` / `sync-jcode.py`: system `python3` is fine (stdlib only).
 
 ### Testing Code Changes Safely
 Never modify real user configs. Always use env overrides:
@@ -85,13 +98,14 @@ Never modify real user configs. Always use env overrides:
 LITELLM_DB_FILE=/tmp/test_db.json \
 LITELLM_YAML_FILE=/tmp/test_config.yaml \
 OPENCODE_JSON=/tmp/test_opencode.json \
+JCODE_CONFIG=/tmp/test_jcode.toml \
 LITELLM_SECRET_FILE=/tmp/test_master.key \
 ~/.config/litellm/venv/bin/python wizard.py
 ```
 
 ### Checks (run all before finishing)
 ```bash
-python3 -m py_compile wizard.py sync-opencode.py engine.py tui.py
+python3 -m py_compile wizard.py sync-opencode.py sync-jcode.py engine.py tui.py
 ~/.config/litellm/venv/bin/python -m unittest discover -s tests
 ~/.config/litellm/venv/bin/python -m pytest tests/   # same suite, pytest runner
 ruff check wizard.py sync-opencode.py engine.py tui.py tests/

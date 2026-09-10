@@ -129,7 +129,7 @@ def load_aliases(litellm_config):
             with open(litellm_config) as f:
                 cfg = yaml.safe_load(f) or {}
             seen, aliases, roles = set(), [], []
-            for item in cfg.get("model_list", []):
+            for item in (cfg.get("model_list") or []):
                 a = item.get("model_name")
                 if a and a not in seen:
                     seen.add(a)
@@ -142,7 +142,8 @@ def load_aliases(litellm_config):
                 return aliases, roles, f"config ({litellm_config})"
         except ImportError:
             pass  # fall through to providers_db.json
-    db_path = os.path.join(LITELLM_DIR, "providers_db.json")
+    db_path = os.environ.get("LITELLM_DB_FILE",
+                             os.path.join(LITELLM_DIR, "providers_db.json"))
     with open(db_path) as f:
         db = json.load(f)
     # Unified aliases: single gateway name -> many providers (evade rate limits)

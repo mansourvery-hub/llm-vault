@@ -6,7 +6,7 @@ credentials + model capabilities + quota domains + routing policy into
 LiteLLM YAML. LiteLLM remains the runtime router; this wizard is the
 control plane / configuration compiler.
 """
-__version__ = "2.5.0"
+__version__ = "2.6.0"
 SCHEMA_VERSION = 2
 import datetime
 import hashlib
@@ -4040,6 +4040,169 @@ def maybe_sync_opencode():
         print(f"  [!] Sync failed safely ({str(e)[:120]}). Gateway config is unaffected.")
 
 
+# ---------- jcode target (export/import; JCode stays an output target) ---
+
+JCODE_CONFIG_PATH = os.environ.get(
+    "JCODE_CONFIG", os.path.join(os.path.expanduser("~"), ".jcode", "config.toml"))
+
+
+def _load_jcode_sync():
+    """Import sync-jcode.py as a module (single implementation, CLI+engine)."""
+    import importlib.util
+    here = os.path.dirname(os.path.abspath(__file__))
+    for cand in (os.path.join(here, "sync-jcode.py"), "sync-jcode.py"):
+        if os.path.exists(cand):
+            spec = importlib.util.spec_from_file_location("sync_jcode", cand)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod
+    raise FileNotFoundError("sync-jcode.py not found next to wizard.py")
+
+
+def sync_jcode_now(db, dry_run=False):
+    """CLI: sync gateway logical models into JCode's config.toml."""
+    try:
+        syncj = _load_jcode_sync()
+    except FileNotFoundError as e:
+        print(f"  [!] {e}")
+        return False
+    path = JCODE_CONFIG_PATH
+    print(f"\n  JCode target: {path}")
+    try:
+        result = syncj.sync(path, YAML_FILE, dry_run=dry_run, print_block=False,
+                            include_roles=True, set_default=True,
+                            overwrite_externally_changed=False)
+    except ValueError as e:
+        print(f"  [!] {e}")
+        if "managed_hash mismatch" in str(e):
+            print("  [i] Options: import it ('jcode import') to adopt the "
+                  "changes, or run:  python3 sync-jcode.py --overwrite-external")
+        return False
+    except FileNotFoundError as e:
+        print(f"  [!] Nothing to sync yet — {str(e)[:100]}")
+        print("  [i] Configure providers in the wizard and press Q to compile first.")
+        return False
+    except OSError as e:
+        print(f"  [!] Sync failed safely ({str(e)[:120]}).")
+        return False
+    exposed = result["models"]
+    print(f"  [+] {len(exposed)} logical model(s): {', '.join(exposed[:8])}"
+          + (" ..." if len(exposed) > 8 else ""))
+    if not result.get("wrote"):
+        print("  [=] Dry run — nothing written.")
+        return True
+    if result.get("backup"):
+        print(f"  [+] Backup: {result['backup']}")
+    chg = []
+    if result.get("added"):
+        chg.append(f"+{len(result['added'])} ({', '.join(result['added'][:4])})")
+    if result.get("removed"):
+        chg.append(f"-{len(result['removed'])} ({', '.join(result['removed'][:4])})")
+    print("  [+] " + ("; ".join(chg) if chg else "no model changes")
+          + " — unrelated JCode settings untouched.")
+    print("  [i] Try it: jcode --provider-profile llm-proxy-wizard")
+    return True
+
+
+def maybe_sync_jcode():
+    """Q-time offer: sync the gateway block into JCode. Never raises."""
+    path = JCODE_CONFIG_PATH
+    if not os.path.exists(path):
+        # JCode not installed: nothing to offer, stay quiet
+        return
+    try:
+        syncj = _load_jcode_sync()
+        with open(path) as f:
+            profiles = syncj.parse_profiles(f.read())
+        prof = profiles.get(syncj.MANAGED_PROFILE)
+        aliases = _gateway_aliases()
+        if not aliases:
+            return
+        if prof and [m.get("id") for m in prof.get("models", [])] == list(aliases):
+            return  # already in sync — stay quiet
+    except Exception:  # noqa: BLE001 -- the Q-time offer must never break quitting
+        return
+    try:
+        ans = input("  Also sync these models to JCode (~/.jcode/config.toml)? [Y/n]: "
+                    ).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print("\n  [-] JCode sync skipped.")
+        return
+    if ans not in ("", "y", "yes"):
+        print("  [-] Left JCode unchanged (manual: sync-jcode.py).")
+        return
+    db = load_db()
+    sync_jcode_now(db)
+
+
+def import_opencode_now(db):
+    """CLI: import provider/model config from opencode.json into the DB."""
+    path = os.environ.get(
+        "OPENCODE_JSON",
+        os.path.join(os.path.expanduser("~"), ".config", "opencode", "opencode.json"))
+    print(f"\n--- Import from OpenCode ({path}) ---")
+    if not os.path.exists(path):
+        print("  [!] No OpenCode config found — nothing to import.")
+        return
+    # reuse the engine facade (same logic the TUI uses)
+    try:
+        import engine as _engine
+        result = _engine.import_opencode(db)
+    except Exception as e:  # noqa: BLE001 -- report, don't crash the shell
+        print(f"  [!] Import failed: {str(e)[:140]}")
+        return
+    if not result.get("ok"):
+        print(f"  [!] {result.get('note', 'import failed')}")
+        return
+    if result.get("gateway_models"):
+        print(f"  [=] OpenCode already uses the wizard's LiteLLM gateway "
+              f"({len(result['gateway_models'])} logical model(s) — nothing to import).")
+    imported = result.get("providers", [])
+    if not imported:
+        print("  [i] No direct (non-gateway) providers with models found.")
+        return
+    for r in imported:
+        tag = "new" if r.get("created") else "matched"
+        print(f"  [+] {r.get('name', '?')}: {tag} endpoint {r.get('base_url')} "
+              f"(+{len(r.get('new_models', []))} model(s), "
+              f"{r.get('total_models', 0)} total)")
+    save_db(db)
+    print("  [+] Imported. Secrets (if any) are stored as credentials — never printed.")
+    print("  [i] Validate keys from the provider screen, then Q to compile.")
+
+
+def import_jcode_now(db):
+    """CLI: import provider profiles from JCode's config.toml into the DB."""
+    path = JCODE_CONFIG_PATH
+    print(f"\n--- Import from JCode ({path}) ---")
+    if not os.path.exists(path):
+        print("  [!] No JCode config found — nothing to import.")
+        return
+    try:
+        import engine as _engine
+        result = _engine.import_jcode(db)
+    except Exception as e:  # noqa: BLE001 -- report, don't crash the shell
+        print(f"  [!] Import failed: {str(e)[:140]}")
+        return
+    if not result.get("ok"):
+        print(f"  [!] {result.get('note', 'import failed')}")
+        return
+    if result.get("managed_models"):
+        print(f"  [=] JCode already uses the wizard's gateway profile "
+              f"({len(result['managed_models'])} logical model(s) — not re-imported).")
+    imported = result.get("providers", [])
+    if not imported:
+        print("  [i] No custom provider profiles with models found.")
+        return
+    for r in imported:
+        tag = "new" if r.get("created") else "matched"
+        print(f"  [+] {r.get('name', '?')}: {tag} endpoint {r.get('base_url')} "
+              f"(+{len(r.get('new_models', []))} model(s), "
+              f"{r.get('total_models', 0)} total)")
+    save_db(db)
+    print("  [+] Imported. Validate keys from the provider screen, then Q to compile.")
+
+
 def _resolve_pid(db, text):
     num, res = resolve_provider(text, db)
     if num == "C" and isinstance(res, dict):
@@ -4156,6 +4319,12 @@ def show_help():
     all         show the detailed view / back to the short view
     help        this text
 
+  Clients (OpenCode / JCode):
+    jcode           sync logical models into ~/.jcode/config.toml
+    jcode import    adopt an existing JCode provider config into the wizard
+    import          adopt an existing OpenCode provider config into the wizard
+    opencode        sync logical models into opencode.json
+
   Words you'll see:
     key       one API key you pasted in.
     quota     the provider's speed limit bucket. Several keys can share one
@@ -4174,6 +4343,22 @@ def main():
     if "--diagnose" in sys.argv or "diagnose" in sys.argv[1:]:
         diagnose(load_db())
         return
+    # explicit sync/import targets (non-interactive one-shots)
+    if "--sync-jcode" in sys.argv:
+        db = load_db()
+        ok = sync_jcode_now(db, dry_run="--dry-run" in sys.argv)
+        sys.exit(0 if ok else 1)
+    if "--sync-opencode" in sys.argv:
+        maybe_sync_opencode()
+        sys.exit(0)
+    if "--import-opencode" in sys.argv:
+        db = load_db()
+        import_opencode_now(db)
+        sys.exit(0)
+    if "--import-jcode" in sys.argv:
+        db = load_db()
+        import_jcode_now(db)
+        sys.exit(0)
     db = load_db()
     cleaned, emptied = normalize_aliases(db)
     if cleaned:
@@ -4213,6 +4398,8 @@ def main():
                 if before_aliases != after_aliases:
                     maybe_sync_opencode()
                 restart_proxy()
+            if before_aliases != after_aliases:
+                maybe_sync_jcode()
             print("[+] Bye. (Tip: T tries everything through the gateway.)")
             break
         if low == "t":
@@ -4238,6 +4425,25 @@ def main():
             continue
         if low in ("diagnose", "diag", "doctor"):
             diagnose(db)
+            continue
+        if low in ("jcode",):
+            sync_jcode_now(db)
+            db = load_db()
+            continue
+        if low in ("sync jcode", "jcode sync"):
+            sync_jcode_now(db)
+            db = load_db()
+            continue
+        if low in ("jcode import", "import jcode"):
+            import_jcode_now(db)
+            db = load_db()
+            continue
+        if low in ("import opencode", "opencode import", "import"):
+            import_opencode_now(db)
+            db = load_db()
+            continue
+        if low in ("sync opencode", "opencode sync", "opencode"):
+            maybe_sync_opencode()
             continue
         if low in ("plan", "dry-run", "dryrun", "preview", "diff"):
             show_plan(db)

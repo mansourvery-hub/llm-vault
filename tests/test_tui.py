@@ -6,6 +6,7 @@ unmocked network access fails loudly. Milestone 3 flow tests mock at the
 level so the engine delegation path is genuinely exercised.
 """
 import asyncio
+import os
 import tempfile
 import time
 import unittest
@@ -18,6 +19,8 @@ from tui import (
     ConfigureScreen,
     DoneScreen,
     HomeScreen,
+    ImportScreen,
+    JCodeScreen,
     ModelDetailScreen,
     ModelScreen,
     ProviderScreen,
@@ -357,6 +360,56 @@ class TuiPilotTest(unittest.IsolatedAsyncioTestCase):
             status = screen.query_one("#quota-status", tui.Static)
             self.assertIn("2 independent domain(s), 3 key(s)",
                           str(status.render()))
+            await pilot.press("escape")
+            await pilot.pause()
+            self.assertIsInstance(app.screen, HomeScreen)
+
+    async def test_jcode_screen_reachable_and_syncs(self):
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="jcodetui-")
+        paths = engine.EnginePaths.temp(
+            tmp, opencode=os.path.join(tmp, "opencode.json"),
+            jcode=os.path.join(tmp, "jcode_config.toml"))
+        db = engine.load_state(paths)
+        engine.add_credentials(db, "gemini", ["GK1-FAKE"])
+        db["gemini"]["models"] = ["gemini-3.7-flash"]
+        engine.save_state(db, paths)
+        # gateway yaml so sync has aliases (patched: writes to temp paths)
+        with engine._patched_wizard(paths):
+            engine._wiz.generate_yaml(db)
+        app = WizardApp(paths=paths, status="unknown", status_auto_refresh=False,
+                        auto_probe=False)
+        async with app.run_test(size=(100, 50)) as pilot:
+            await pilot.pause()
+            # sync-targets line rendered on Home
+            targets = str(app.screen.query_one("#sync-targets", tui.Static).render())
+            self.assertIn("JCode", targets)
+            await pilot.press("j")
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, JCodeScreen)
+            await pilot.click("#sync-jcode")
+            await pilot.pause()
+            self.assertTrue(os.path.exists(paths.jcode_config))
+
+            def _read_config() -> str:
+                with open(paths.jcode_config) as f:
+                    return f.read()
+
+            text = await asyncio.to_thread(_read_config)
+            self.assertIn("[providers.llm-proxy-wizard]", text)
+            self.assertIn('id = "gemini-3.7-flash"', text)
+            await pilot.press("escape")
+            await pilot.pause()
+            self.assertIsInstance(app.screen, HomeScreen)
+
+    async def test_import_screen_reachable(self):
+        app = self.make_app()
+        async with app.run_test(size=(100, 50)) as pilot:
+            await pilot.pause()
+            await pilot.press("i")
+            await pilot.pause()
+            self.assertIsInstance(app.screen, ImportScreen)
             await pilot.press("escape")
             await pilot.pause()
             self.assertIsInstance(app.screen, HomeScreen)
