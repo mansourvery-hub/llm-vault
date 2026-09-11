@@ -1,14 +1,9 @@
 #!/usr/bin/env python3
-"""Textual TUI for llm-proxy-wizard.
+"""Textual TUI for llm-vault (hard fork).
 
-Thin presentation layer only. All product logic (provider validation,
-quota math, config compilation, secret handling, OpenCode sync) lives in
-``engine.py`` / ``wizard.py`` — this file must never implement any of it.
-
-Views: Home (deployment table) -> Configure -> Provider (-> ModelScreen)
--> Review(Done), plus Home -> Test and Home -> OpenCode view. Quota/speed/
-routing/alias/service internals are NOT standalone screens; the grouping
-question and retired models surface inside the configure flow only.
+Thin presentation layer only. Vault is main screen; Proxy + Harness tabs are
+dynamic. All vault/proxy logic lives in engine/wizard; sync-*.py owns harness
+mutation. Never holds secrets, quota math, or harness mutation.
 
 Flow: paste keys -> background check -> resolve only genuine ambiguity
 (shared-limit question, retired models) -> pick models -> probe ->
@@ -2468,6 +2463,7 @@ class ImportScreen(Screen):
             yield Button("Import from OpenCode", id="import-opencode",
                          variant="primary")
             yield Button("Import from JCode", id="import-jcode")
+            yield Button("OpenCode → JCode (direct)", id="import-opencode-to-jcode")
             yield Button("Back", id="back")
         yield Footer()
 
@@ -2527,6 +2523,33 @@ class ImportScreen(Screen):
             else:
                 note = "No custom provider profiles with models found."
             self.last_status = note
+        self._render_status()
+
+    @on(Button.Pressed, "#import-opencode-to-jcode")
+    def _import_opencode_to_jcode(self) -> None:
+        app = self.app
+        assert isinstance(app, WizardApp)
+        try:
+            result = _quiet_call(engine.import_opencode_to_jcode, app.paths, False, False)
+        except Exception as e:  # noqa: BLE001 -- report, don't crash
+            self.last_status = f"Import failed ({str(e)[:120]})"
+        else:
+            if not result.get("ok"):
+                self.last_status = f"Import failed: {result.get('note','unknown')}"
+                if result.get("skipped"):
+                    names = [s.get("name","?") for s in result["skipped"][:3]]
+                    self.last_status += f" (skipped: {', '.join(names)})"
+            elif result.get("imported"):
+                names = [r.get("name","?") for r in result["imported"]]
+                self.last_status = f"Imported {len(names)} provider(s) to JCode: {', '.join(names)}."
+                if result.get("skipped"):
+                    self.last_status += f" Skipped {len(result['skipped'])}."
+            else:
+                note = result.get("note") or "No providers imported."
+                if result.get("skipped"):
+                    names = [s.get("name","?") for s in result["skipped"][:3]]
+                    note += f" Skipped: {', '.join(names)}."
+                self.last_status = note
         self._render_status()
 
     def action_back(self) -> None:

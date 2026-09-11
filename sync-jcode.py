@@ -318,9 +318,9 @@ def splice_managed(text, block_text):
     new block, preserving everything else in order."""
     sections = split_sections(text)
     start, end = find_managed_span(sections)
-    # render every non-managed section verbatim; drop the old [provider]
-    # section (the block re-emits it with managed defaults) unless the
-    # user customized it with OTHER fields — then keep their fields.
+    # Collect kept [provider] fields (everything except the two managed
+    # defaults) so they can be merged into the new block's [provider].
+    keep_provider_fields: dict[str, object] = {}
     pieces = []
     for i, (header, body) in enumerate(sections):
         h = header.strip()
@@ -331,12 +331,33 @@ def splice_managed(text, block_text):
             scal = _toml_split_scalars(body)
             keep = {k: v for k, v in scal.items()
                     if k not in ("default_provider", "default_model")}
-            if keep:
-                pieces.append(_render_provider_section(keep))
+            # stash for merging, do not emit yet
+            keep_provider_fields.update(keep)
             continue
         if header:
             pieces.append(header)
         pieces.extend(body)
+    # Merge kept fields into the managed block's [provider] section
+    if keep_provider_fields:
+        block_sections = split_sections(block_text)
+        for idx, (h, b) in enumerate(block_sections):
+            if h.strip() == "[provider]":
+                scal = _toml_split_scalars(b)
+                # keep existing managed defaults, add kept fields if not already present
+                merged = dict(scal)
+                for k, v in keep_provider_fields.items():
+                    if k not in merged:
+                        merged[k] = v
+                # Re-render this section
+                block_sections[idx] = (h, _render_provider_section(merged).splitlines()[1:])
+                break
+        # Reassemble block_text from sections
+        block_pieces = []
+        for h, b in block_sections:
+            if h:
+                block_pieces.append(h)
+            block_pieces.extend(b)
+        block_text = "\n".join(block_pieces)
     body_new = "\n".join(pieces)
     text_new = (body_new.rstrip("\n") + "\n\n" if body_new.strip() else "")
     return text_new + block_text.rstrip("\n") + "\n"

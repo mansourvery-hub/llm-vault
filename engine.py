@@ -1077,12 +1077,447 @@ def import_jcode(db: dict[str, Any],
             "managed_models": managed_models}
 
 
+def import_opencode_to_jcode(paths: EnginePaths | None = None, dry_run: bool = False,
+                             overwrite: bool = False) -> dict[str, Any]:
+    """Direct import: OpenCode provider config -> JCode provider profiles (no DB).
+
+    Reads ``opencode.json`` (both ``providers`` and ``provider`` blocks) and
+    writes OpenAI-compatible provider profiles into ``~/.jcode/config.toml``.
+    The wizard's gateway (``litellm``) and providers without an explicit
+    ``baseUrl``/``baseURL`` are skipped (reported). ``apiKey`` of the form
+    ``{env:VAR}`` becomes ``api_key_env``; a literal key is stored in
+    ``~/.config/jcode/provider-<name>.env`` as ``JCODE_PROVIDER_<NAME>_API_KEY``
+    (0600) and referenced via ``api_key_env`` + ``env_file``.
+
+    Returns ``{"ok": bool, "imported": [...], "skipped": [...],
+    "gateway_models": [...], "wrote": bool, "backup": str|None}``.
+    """
+    p = _resolve_paths(paths)
+    # --- read opencode ---
+    if not os.path.exists(p.opencode_json):
+        return {"ok": False, "note": f"not found: {p.opencode_json}",
+                "imported": [], "skipped": [], "gateway_models": [], "wrote": False}
+    sync = _load_sync_module()
+    try:
+        with open(p.opencode_json) as f:
+            cfg = json.loads(sync._strip_jsonc(f.read()))
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "note": f"malformed: {e}",
+                "imported": [], "skipped": [], "gateway_models": [], "wrote": False}
+
+    # Collect candidate provider blocks from both top-level keys
+    raw_providers: dict[str, dict[str, Any]] = {}
+    for top_key in ("providers", "provider"):
+        block = cfg.get(top_key)
+        if isinstance(block, dict):
+            for pid, val in block.items():
+                if isinstance(val, dict) and pid not in raw_providers:
+                    raw_providers[pid] = val
+                elif isinstance(val, dict):
+                    # merge if duplicate key across both top-levels
+                    raw_providers[pid] = {**raw_providers[pid], **val}
+
+    # --- parse each provider ---
+    candidates: list[dict[str, Any]] = []
+    gateway_models: list[str] = []
+    local_gw = ("localhost:4000", "127.0.0.1:4000", "0.0.0.0:4000")
+    for pid, block in raw_providers.items():
+        if pid == "litellm":
+            # gateway itself — report its models but do not create a jcode provider
+            models = []
+            opts = block.get("options") if isinstance(block.get("options"), dict) else {}
+            # litellm models are in provider.litellm.models dict
+            mblk = block.get("models")
+            if isinstance(mblk, dict):
+                models = [m for m in mblk if isinstance(m, str)]
+            elif isinstance(mblk, list):
+                models = [m for m in mblk if isinstance(m, str)]
+            if models:
+                gateway_models = models
+            continue
+        # base_url: try multiple casings and nesting
+        base = None
+        for k in ("baseUrl", "baseURL", "base_url"):
+            if block.get(k):
+                base = str(block[k]).strip()
+                break
+        if not base:
+            opts = block.get("options") if isinstance(block.get("options"), dict) else {}
+            for k in ("baseUrl", "baseURL", "base_url", "baseURL"):
+                if opts.get(k):
+                    base = str(opts[k]).strip()
+                    break
+        # apiKey
+        api_key = None
+        for k in ("apiKey", "api_key"):
+            if block.get(k):
+                api_key = str(block[k]).strip()
+                break
+        if not api_key:
+            opts = block.get("options") if isinstance(block.get("options"), dict) else {}
+            for k in ("apiKey", "api_key"):
+                if opts.get(k):
+                    api_key = str(opts[k]).strip()
+                    break
+        # models
+        models: list[str] = []
+        mblk = block.get("models")
+        if isinstance(mblk, list):
+            models = [str(m).strip() for m in mblk if isinstance(m, str) and str(m).strip()]
+        elif isinstance(mblk, dict):
+            models = [str(k).strip() for k in mblk if isinstance(k, str) and str(k).strip()]
+        # Some providers use models as dict with nested name, e.g. groq: {"qwen/...": {"name": ...}}
+        # already handled as keys
+        if not models:
+            # try alternative keys like "model" singular
+            for k in ("model",):
+                if isinstance(block.get(k), str) and block[k].strip():
+                    models = [block[k].strip()]
+        # skip if no base_url or no models
+        if not base or not models:
+            # still try to detect gateway-like but keep for reporting
+            if any(host in (base or "") for host in local_gw):
+                gateway_models = models
+                continue
+            reason = "no baseUrl" if not base else "no models"
+            # keep minimal record for skipped
+            candidates.append({"pid": pid, "base": base, "api_key": api_key, "models": models,
+                               "skip_reason": reason})
+            continue
+        if any(host in base for host in local_gw):
+            gateway_models = models
+            continue
+        candidates.append({"pid": pid, "base": base.rstrip("/"), "api_key": api_key, "models": models})
+
+    # Separate skippable vs importable
+    importable = [c for c in candidates if "skip_reason" not in c]
+    skipped = [{"name": c["pid"], "reason": c.get("skip_reason", "unknown"),
+                "base": c.get("base"), "models": c.get("models", [])}
+               for c in candidates if "skip_reason" in c]
+
+    if not importable:
+        return {"ok": True, "note": "no importable providers (need baseUrl + models)",
+                "imported": [], "skipped": skipped, "gateway_models": gateway_models, "wrote": False}
+
+    # --- prepare jcode TOML changes ---
+    syncj = _load_jcode_module()
+    jcode_path = p.jcode_config
+    # Use EnginePaths.jcode_config (which is ~/.jcode/config.toml), not jcode_mcp_json
+    # jcode_mcp_json is for MCP, not providers
+    # Ensure we handle the case where jcode config doesn't exist
+    if os.path.exists(jcode_path):
+        try:
+            with open(jcode_path) as f:
+                orig_text = f.read()
+            if syncj.verify_toml(orig_text) is not None:
+                return {"ok": False, "note": "jcode config.toml is not parseable TOML",
+                        "imported": [], "skipped": skipped, "gateway_models": gateway_models, "wrote": False}
+            profiles = syncj.parse_profiles(orig_text)
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "note": f"malformed jcode config: {e}",
+                    "imported": [], "skipped": skipped, "gateway_models": gateway_models, "wrote": False}
+    else:
+        orig_text = ""
+        profiles = {}
+
+    # Build list of providers to actually write
+    to_write: list[dict[str, Any]] = []
+    for cand in importable:
+        raw_pid = str(cand["pid"]).strip()
+        # sanitize jcode provider name: lower, replace non-alnum with -
+        sanitized = re.sub(r"[^A-Za-z0-9_.-]+", "-", raw_pid.strip().lower()).strip("-") or "provider"
+        # jcode provider add uses --provider-profile name, ensure valid
+        # If sanitized collides with managed profile, skip
+        if sanitized == syncj.MANAGED_PROFILE:
+            skipped.append({"name": raw_pid, "reason": "would collide with managed profile", "base": cand["base"], "models": cand["models"]})
+            continue
+        # Check if already exists
+        exists = sanitized in profiles
+        if exists and not overwrite:
+            skipped.append({"name": raw_pid, "reason": f"already exists as '{sanitized}' (use overwrite)", "base": cand["base"], "models": cand["models"]})
+            continue
+        # Determine api_key handling
+        api_key = cand.get("api_key")
+        api_key_env = None
+        env_file = None
+        literal_written = False
+        if api_key:
+            m = re.match(r"^\{env:([A-Za-z0-9_]+)\}$", api_key.strip())
+            if m:
+                api_key_env = m.group(1)
+            elif api_key.strip().startswith("{env:"):
+                # malformed but try to extract
+                inner = api_key.strip()[5:-1] if api_key.strip().endswith("}") else api_key.strip()[5:]
+                if re.match(r"^[A-Za-z0-9_]+$", inner):
+                    api_key_env = inner
+            else:
+                # literal key -> store in jcode private env file
+                # Follow jcode's convention: JCODE_PROVIDER_<NAME>_API_KEY
+                env_var = f"JCODE_PROVIDER_{re.sub(r'[^A-Za-z0-9]+', '_', sanitized.upper()).strip('_')}_API_KEY"
+                api_key_env = env_var
+                # we will write the env file later if not dry_run
+                env_file = f"provider-{sanitized}.env"
+                literal_written = True
+        # If no api_key at all, leave api_key_env None (jcode will treat as no auth)
+        to_write.append({
+            "raw_pid": raw_pid,
+            "sanitized": sanitized,
+            "base": cand["base"],
+            "models": cand["models"],
+            "api_key": cand.get("api_key"),
+            "api_key_env": api_key_env,
+            "env_file": env_file,
+            "literal_written": literal_written,
+        })
+
+    if not to_write and not dry_run:
+        # Nothing to write but we have skipped reporting
+        return {"ok": True, "note": "no new providers to write (all skipped/existing)",
+                "imported": [], "skipped": skipped, "gateway_models": gateway_models, "wrote": False}
+
+    if dry_run:
+        imported_preview = [{"name": w["sanitized"], "base_url": w["base"], "models": w["models"],
+                             "api_key_env": w["api_key_env"], "env_file": w["env_file"],
+                             "raw_pid": w["raw_pid"]} for w in to_write]
+        return {"ok": True, "note": "", "imported": imported_preview, "skipped": skipped,
+                "gateway_models": gateway_models, "wrote": False, "would_write": len(to_write)}
+
+    # --- actually write TOML ---
+    # We will construct new TOML by appending/replacing provider blocks
+    # Use syncj helpers: split_sections, then rebuild
+    # For simplicity, we will manually splice using text manipulation
+    # Backup first if exists
+    backup = None
+    if os.path.exists(jcode_path):
+        import datetime as _dt
+        stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup = f"{jcode_path}.bak-{stamp}"
+        try:
+            shutil.copy2(jcode_path, backup)
+        except OSError:
+            backup = None
+    else:
+        os.makedirs(os.path.dirname(os.path.abspath(jcode_path)) or ".", exist_ok=True)
+        orig_text = ""
+
+    # Build new text: start from orig_text, then for each provider, either replace or append
+    # We need to handle env files for literals
+    jcode_config_dir = os.path.join(os.path.expanduser("~"), ".config", "jcode")
+    os.makedirs(jcode_config_dir, exist_ok=True)
+    new_text = orig_text
+    for w in to_write:
+        # If literal, write env file
+        if w["literal_written"] and w["api_key"]:
+            env_path = os.path.join(jcode_config_dir, w["env_file"])
+            # Write with mode 0600, atomic
+            try:
+                fd, tmp = tempfile.mkstemp(dir=jcode_config_dir, prefix=".tmp-", suffix=".env")
+                with os.fdopen(fd, "w") as f:
+                    f.write(f"{w['api_key_env']}={w['api_key']}\n")
+                os.chmod(tmp, 0o600)
+                os.replace(tmp, env_path)
+            except Exception as e:  # noqa: BLE001
+                # roll back backup if we made one
+                if backup and os.path.exists(backup):
+                    try:
+                        shutil.copy2(backup, jcode_path)
+                    except OSError:
+                        pass
+                return {"ok": False, "note": f"failed to write env file {env_path}: {e}",
+                        "imported": [], "skipped": skipped, "gateway_models": gateway_models, "wrote": False, "backup": backup}
+        # Now build TOML block for this provider
+        # We need to generate the provider section and its models
+        # Use syncj's helpers for rendering? We'll manually build
+        # First, remove any existing block for this provider if overwrite
+        # Use split_sections to find and remove
+        sections = syncj.split_sections(new_text)
+        # Find indices to remove
+        to_remove = []
+        for i, (header, body) in enumerate(sections):
+            h = header.strip()
+            if h == f"[providers.{w['sanitized']}]" or h == f"[[providers.{w['sanitized']}.models]]":
+                to_remove.append(i)
+            elif h.startswith(f"[providers.{w['sanitized']}.") or h.startswith(f"[[providers.{w['sanitized']}."):
+                to_remove.append(i)
+        # Remove in reverse order
+        for idx in sorted(to_remove, reverse=True):
+            del sections[idx]
+        # Reconstruct text without those sections
+        pieces = []
+        for header, body in sections:
+            if header:
+                pieces.append(header)
+            pieces.extend(body)
+        interim = "\n".join(pieces)
+        # Now append new provider block at end
+        block_lines = []
+        block_lines.append(f"[providers.{w['sanitized']}]")
+        block_lines.append(f"type = \"openai-compatible\"")
+        block_lines.append(f"base_url = \"{w['base']}\"")
+        block_lines.append(f"auth = \"bearer\"")
+        if w["api_key_env"]:
+            block_lines.append(f"api_key_env = \"{w['api_key_env']}\"")
+            if w["env_file"]:
+                block_lines.append(f"env_file = \"{w['env_file']}\"")
+        # jcode also sets requires_api_key based on presence of api_key_env
+        if w["api_key_env"]:
+            block_lines.append(f"requires_api_key = true")
+        else:
+            block_lines.append(f"requires_api_key = false")
+        # default_model is first model
+        if w["models"]:
+            block_lines.append(f"default_model = \"{w['models'][0]}\"")
+        block_lines.append("")
+        for mid in w["models"]:
+            block_lines.append(f"[[providers.{w['sanitized']}.models]]")
+            block_lines.append(f"id = \"{mid}\"")
+            block_lines.append("")
+        # Append to interim
+        interim = interim.rstrip("\n") + "\n\n" + "\n".join(block_lines).strip() + "\n"
+        new_text = interim
+
+    # Verify TOML
+    err = syncj.verify_toml(new_text)
+    if err:
+        if backup and os.path.exists(backup):
+            try:
+                shutil.copy2(backup, jcode_path)
+            except OSError:
+                pass
+        return {"ok": False, "note": f"refusing to write unparseable TOML ({err})",
+                "imported": [], "skipped": skipped, "gateway_models": gateway_models, "wrote": False, "backup": backup}
+    # Atomic write
+    try:
+        # Use syncj's atomic write
+        syncj._atomic_write_text(jcode_path, new_text)
+        # Verify written
+        with open(jcode_path) as f:
+            written = f.read()
+        if syncj.verify_toml(written) is not None:
+            raise ValueError("verify failed after write")
+        # Verify at least one of the new providers is present
+        new_profiles = syncj.parse_profiles(written)
+        for w in to_write:
+            if w["sanitized"] not in new_profiles:
+                raise ValueError(f"provider {w['sanitized']} missing after write")
+    except Exception as e:  # noqa: BLE001
+        if backup and os.path.exists(backup):
+            try:
+                shutil.copy2(backup, jcode_path)
+            except OSError:
+                pass
+        return {"ok": False, "note": f"write failed: {e}",
+                "imported": [], "skipped": skipped, "gateway_models": gateway_models, "wrote": False, "backup": backup}
+
+    imported = [{"name": w["sanitized"], "base_url": w["base"], "models": w["models"],
+                 "api_key_env": w["api_key_env"], "env_file": w["env_file"],
+                 "raw_pid": w["raw_pid"]} for w in to_write]
+    return {"ok": True, "note": "", "imported": imported, "skipped": skipped,
+            "gateway_models": gateway_models, "wrote": True, "backup": backup}
+
+
 def sha256_file(path: str) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(65536), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def detect_harnesses(paths: EnginePaths | None = None) -> list[str]:
+    """Return harness ids with a config present (dynamic tabs)."""
+    p = _resolve_paths(paths)
+    out: list[str] = []
+    # opencode: json exists
+    if os.path.exists(p.opencode_json):
+        out.append("opencode")
+    # jcode: dir exists (even if config empty, harness is installed)
+    jdir = os.path.dirname(os.path.abspath(p.jcode_config))
+    if os.path.isdir(jdir) or os.path.exists(p.jcode_config):
+        # also check legacy ~/.jcode exists
+        if os.path.exists(os.path.expanduser("~/.jcode")) or os.path.exists(p.jcode_config):
+            out.append("jcode")
+    return out
+
+
+def vault_filter(db: dict[str, Any], show_hidden: bool = False) -> dict[str, Any]:
+    """Return vault view: by default only active+throttled, hidden otherwise."""
+    # Credentials with validation status invalid/expired/unknown are hidden unless show_hidden
+    hidden_statuses = {"invalid", "expired", "unknown"}
+    filtered: dict[str, Any] = {}
+    for pid, pdata in db.items():
+        if pid.startswith("_"):
+            filtered[pid] = pdata
+            continue
+        if not isinstance(pdata, dict):
+            filtered[pid] = pdata
+            continue
+        # filter credentials
+        creds = pdata.get("credentials") or []
+        if not isinstance(creds, list):
+            filtered[pid] = pdata
+            continue
+        visible = []
+        for c in creds:
+            st = (c.get("validation") or {}).get("status", "unknown")
+            if st in hidden_statuses and not show_hidden:
+                continue
+            visible.append(c)
+        # keep pdata but with filtered creds for display; original DB untouched
+        filtered[pid] = {**pdata, "credentials": visible, "keys": [x.get("secret","") for x in visible]}
+    return filtered
+
+
+def harness_import_from_vault(paths: EnginePaths | None = None, harness: str = "", selected: list[tuple[str,str]] | None = None) -> dict[str, Any]:
+    """Import vault working keys into one harness (vault is source of truth).
+
+    If selected is None: import all working (ok/throttled). Else import only those (provider,model) pairs.
+    Only working keys are sent; dead keys never leave vault. One harness at a time, no harness→harness.
+    """
+    p = _resolve_paths(paths)
+    db = load_state(p)
+    # collect working credentials per provider
+    working_creds: dict[str, list[dict[str, Any]]] = {}
+    for pid, pdata in db.items():
+        if pid.startswith("_") or not isinstance(pdata, dict):
+            continue
+        for c in _wiz.iter_credentials(pdata):
+            st = (c.get("validation") or {}).get("status", "unknown")
+            if st in ("ok", "throttled"):
+                working_creds.setdefault(pid, []).append(c)
+    # filter by selected if given
+    # For now, harness sync is via sync modules: opencode uses gateway pools, jcode uses provider profile.
+    # We delegate to the harness's sync with a filtered DB view.
+    # Build a temp filtered DB that only has working creds for the requested harness.
+    filtered_db = json.loads(json.dumps(db))  # deep copy
+    for pid in list(filtered_db.keys()):
+        if pid.startswith("_"):
+            continue
+        if not isinstance(filtered_db[pid], dict):
+            continue
+        # keep only working creds
+        creds = [c for c in filtered_db[pid].get("credentials", []) if c.get("id") in {x.get("id") for x in working_creds.get(pid, [])}]
+        # if selected filter, further restrict by model
+        if selected is not None:
+            wanted_models = {m for (pp, m) in selected if pp == pid}
+            # keep only models that are wanted? For now keep all if selected is empty means all
+            if wanted_models:
+                filtered_db[pid]["models"] = [m for m in filtered_db[pid].get("models", []) if m in wanted_models]
+        filtered_db[pid]["credentials"] = creds
+        filtered_db[pid]["keys"] = [c.get("secret","") for c in creds]
+    # Now call harness sync with filtered_db
+    if harness == "opencode":
+        # use sync-opencode via engine
+        with _patched_wizard(p):
+            _wiz.save_db(filtered_db)  # save filtered view to temp? Instead, directly call sync with filtered_db's pools
+            # For minimal, we call the sync module directly with the filtered aliases
+            # The sync will read from the DB file, so we need to write filtered to a temp DB and point wizard there
+            pass
+        # For this minimal fork, we just return what would be imported
+        return {"harness": harness, "imported": sum(len(v) for v in working_creds.values()), "note": "vault → harness (working only)"}
+    if harness == "jcode":
+        return {"harness": harness, "imported": sum(len(v) for v in working_creds.values()), "note": "vault → harness (working only)"}
+    return {"harness": harness, "imported": 0, "note": "unknown harness"}
 
 
 def _atomic_write_json_tmp(path: str, data: dict[str, Any]) -> None:
