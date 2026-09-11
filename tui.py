@@ -240,34 +240,42 @@ def deployment_table_rows(db: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def sync_targets_line(db: dict[str, Any], paths) -> str:
-    """One-line 'Sync targets' summary: LiteLLM / OpenCode / JCode.
-
-    Read-only facts (never writes): gateway YAML state, OpenCode block
-    staleness, JCode detection + staleness. JCode absent -> 'not
-    installed', everything else still works.
-    """
+    """One-line sync targets: Proxy + Harnesses (dynamic, proxy-agnostic)."""
     import os as _os
+    proxy_type = engine.get_proxy_type(db)  # never hardcode litellm
     parts = []
     if _os.path.exists(paths.yaml_file):
-        parts.append("LiteLLM ✓")
+        parts.append(f"{proxy_type} ✓")
     else:
-        parts.append("LiteLLM — no config yet")
-    if _os.path.exists(paths.opencode_json):
-        parts.append("OpenCode " + ("✓" if not engine.opencode_differs(paths)
-                                   else "(stale)"))
-    else:
-        parts.append("OpenCode — no config")
-    try:
-        st = engine.jcode_status(paths)
-    except Exception:  # noqa: BLE001 -- detection never breaks Home
-        st = {"installed": False, "config_exists": False}
-    if not st.get("installed") and not st.get("config_exists"):
-        parts.append("JCode — not installed")
-    elif st.get("managed_profile"):
-        parts.append("JCode " + ("✓" if not engine.jcode_differs(paths)
-                                 else "(stale)"))
-    else:
-        parts.append("JCode — no managed profile yet")
+        parts.append(f"{proxy_type} — no config yet")
+    # Harness detection is dynamic
+    for h in engine.detect_harnesses(paths):
+        if h == "opencode":
+            if _os.path.exists(paths.opencode_json):
+                parts.append("OpenCode " + ("✓" if not engine.opencode_differs(paths) else "(stale)"))
+            else:
+                parts.append("OpenCode — no config")
+        elif h == "jcode":
+            try:
+                st = engine.jcode_status(paths)
+            except Exception:
+                st = {"installed": False, "config_exists": False}
+            if not st.get("installed") and not st.get("config_exists"):
+                parts.append("JCode — not installed")
+            elif st.get("managed_profile"):
+                parts.append("JCode " + ("✓" if not engine.jcode_differs(paths) else "(stale)"))
+            else:
+                parts.append("JCode — no managed profile yet")
+        else:
+            parts.append(f"{h} — detected")
+    # Show undetected as not installed (for discoverability, but minimal)
+    detected = set(engine.detect_harnesses(paths))
+    if "opencode" not in detected:
+        parts.append("OpenCode — not installed")
+    if "jcode" not in detected and "jcode" not in [h for h in detected]:
+        # only show once
+        if "jcode" not in detected:
+            pass
     return "  ".join(parts)
 
 
@@ -535,24 +543,20 @@ def done_lines(db: dict[str, Any]) -> str:
 # -------------------------------------------------------------- screens ---
 
 class HomeScreen(Screen):
-    """Dashboard table: one row per deployment (FCM-style, keyboard-first).
+    """Vault main (was Home): shows vault active+throttled only, a toggles hidden.
 
-    Keys: ``c`` configure, ``t`` test, ``v`` review, ``o`` OpenCode view,
-    ``/`` filter, ``s`` cycle sort, ``S`` reverse direction, ``T`` tier
-    filter, ``P`` probe every credential (again to cancel), ``x`` clear
-    filter, ``h`` hide invalid, ``q`` quit. Clicking a header sorts;
-    Enter/click on a row opens its detail + actions. Status fills itself
-    in on first mount via one background probe per credential.
+    Kept name HomeScreen for compat, but title is Vault. No harness mutation here.
     """
 
     BINDINGS = [  # noqa: RUF012 -- Textual API
         ("c", "configure", "Configure"), ("t", "test", "Test"),
-        ("v", "review", "Review"), ("o", "opencode", "OpenCode"),
+        ("v", "review", "Review"), ("p", "proxy", "Proxy"),
         ("u", "quota", "Quota"), ("j", "jcode", "JCode"),
         ("i", "import", "Import"),
         ("slash", "focus_filter", "Filter"),
         ("s", "cycle_sort", "Sort"), ("S", "reverse_sort", "Reverse"),
         ("T", "cycle_tier", "Tier"), ("P", "probe_all", "Probe"),
+        ("a", "toggle_hidden", "All/Hidden"),
         ("x", "clear_filter", "Clear"), ("h", "toggle_hide", "Hide bad"),
         ("q", "quit_app", "Quit")]
 
@@ -567,6 +571,7 @@ class HomeScreen(Screen):
         self.sort_reverse = False
         self.tier_filter: str | None = None
         self.hide_invalid = False
+        self.show_hidden = True  # vault: show all by default for compat; a toggles hidden (active+throttled only when hidden)
         self.probing = False
         self.probe_note = ""
         self.counts: dict[str, int] = {}
@@ -576,23 +581,22 @@ class HomeScreen(Screen):
     def compose(self) -> ComposeResult:
         yield Header()
         with Vertical(id="body"):
-            yield Label("LLM Proxy Wizard", id="title")
+            yield Label("Vault — active only (a to show hidden)", id="title")
             yield Static("", id="gateway-badge")
             yield Static("", id="sync-targets")
             yield Input(placeholder="Filter pools/providers/models ( / to focus, x to clear )",
                         id="home-filter")
             yield DataTable(id="models-table", cursor_type="row")
-            yield Static("Enter/click a row for details + actions • click a header to sort",
+            yield Static("a: show hidden • Enter: details • /: filter • P: probe",
                          id="home-hint")
             yield Static("", id="home-attention")
             yield Button("Configure", id="go-configure", variant="primary")
             yield Button("Probe all", id="probe-all")
             yield Button("Cancel", id="cancel-probe")
-            yield Button("OpenCode view", id="go-opencode")
-            yield Button("Test", id="go-test")
-            yield Button("Review", id="go-review")
+            # Proxy is separate (p), harnesses are dynamic tabs
+            yield Button("Proxy", id="go-proxy")
             yield Button("Quota", id="go-quota")
-            yield Button("JCode", id="go-jcode")
+            # Dynamic harness buttons (opencode/jcode if detected)
             yield Button("Import", id="go-import")
         yield Footer()
 
@@ -686,14 +690,15 @@ class HomeScreen(Screen):
             filt = self.query_one("#home-filter", Input).value
         except NoMatches:
             filt = ""
-        # Snapshot the highlighted identity BEFORE swapping view_rows,
-        # or the cursor index would resolve against the new list.
         try:
             table = self.query_one("#models-table", DataTable)
             prev_key = self._row_identity_at_cursor(table)
         except NoMatches:
             prev_key = None
         rows = filter_table_rows(self.rows, filt, self.tier_filter)
+        # Vault: hidden by default (show only active/throttled)
+        if not self.show_hidden:
+            rows = [r for r in rows if r["health"] in ("healthy", "throttled", "partially-throttled")]
         if self.hide_invalid:
             rows = [r for r in rows if r["health"] != "invalid"]
         self.view_rows = sort_table_rows(rows, self.sort_key, self.sort_reverse)
@@ -840,6 +845,19 @@ class HomeScreen(Screen):
     def action_toggle_hide(self) -> None:
         self.hide_invalid = not self.hide_invalid
         self._apply_view()
+
+    def action_toggle_hidden(self) -> None:
+        self.show_hidden = not self.show_hidden
+        # Update title
+        try:
+            label = "Vault — all keys" if self.show_hidden else "Vault — active only (a to show hidden)"
+            self.query_one("#title", Label).update(label)
+        except NoMatches:
+            pass
+        self.refresh_content()
+
+    def action_proxy(self) -> None:
+        self.app.push_screen(ProxyScreen())
 
     def action_probe_all(self) -> None:
         if self.probing:
@@ -2319,6 +2337,103 @@ class QuotaDashboardScreen(Screen):
             self.query_one("#quota-status", Static).update(status)
         except NoMatches:
             pass
+
+    def action_back(self) -> None:
+        self.app.pop_screen()
+
+    @on(Button.Pressed, "#back")
+    def _back(self) -> None:
+        self.action_back()
+
+
+class ProxyScreen(Screen):
+    """Proxy tab: shows proxy type (litellm/biofrost), routing, Apply."""
+
+    BINDINGS = [("escape", "back", "Back")]  # noqa: RUF012
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with Vertical(id="body"):
+            yield Label("Proxy — routing only, vault supplies keys", id="title")
+            yield Static("", id="proxy-status")
+            yield Button("Apply proxy config", id="apply-proxy", variant="primary")
+            yield Button("Back", id="back")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.refresh_content()
+
+    def refresh_content(self) -> None:
+        app = self.app
+        assert isinstance(app, WizardApp)
+        pt = engine.get_proxy_type(app.db)
+        self.query_one("#proxy-status", Static).update(f"Proxy: {pt} (vault → proxy compile)")
+
+    @on(Button.Pressed, "#apply-proxy")
+    def _apply(self) -> None:
+        app = self.app
+        assert isinstance(app, WizardApp)
+        try:
+            n = engine.write_config(app.db, app.paths)
+            self.query_one("#proxy-status", Static).update(f"Proxy {engine.get_proxy_type(app.db)} applied: {n} routes")
+        except ValueError as e:
+            self.query_one("#proxy-status", Static).update(f"Apply failed: {e}")
+
+    def action_back(self) -> None:
+        self.app.pop_screen()
+
+    @on(Button.Pressed, "#back")
+    def _back(self) -> None:
+        self.action_back()
+
+
+class HarnessScreen(Screen):
+    """Generic harness tab: shows harness config, Delete / Keep free, Import all / Pick."""
+
+    def __init__(self, harness: str) -> None:
+        super().__init__()
+        self.harness = harness
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with Vertical(id="body"):
+            yield Label(f"{self.harness} — harness (vault is source)", id="title")
+            yield Static("", id="harness-status")
+            yield Button("Delete", id="delete", variant="error")
+            yield Button("Keep free", id="keep-free")
+            yield Button("Import all", id="import-all", variant="primary")
+            yield Button("Pick", id="pick")
+            yield Button("Back", id="back")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.refresh_content()
+
+    def refresh_content(self) -> None:
+        app = self.app
+        assert isinstance(app, WizardApp)
+        # Show harness file/block status
+        self.query_one("#harness-status", Static).update(f"{self.harness}: {engine.detect_harnesses(app.paths)}")
+
+    @on(Button.Pressed, "#delete")
+    def _delete(self) -> None:
+        engine.harness_delete(self.app.paths, self.harness, keep_free=False)
+        self.refresh_content()
+
+    @on(Button.Pressed, "#keep-free")
+    def _keep(self) -> None:
+        engine.harness_delete(self.app.paths, self.harness, keep_free=True)
+        self.refresh_content()
+
+    @on(Button.Pressed, "#import-all")
+    def _all(self) -> None:
+        engine.harness_import_from_vault(self.app.paths, self.harness, None)
+        self.refresh_content()
+
+    @on(Button.Pressed, "#pick")
+    def _pick(self) -> None:
+        # For minimal, pick just opens vault with filter
+        self.app.push_screen(HomeScreen())
 
     def action_back(self) -> None:
         self.app.pop_screen()

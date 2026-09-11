@@ -478,6 +478,14 @@ def migrate_db(raw):
     # health
     if not isinstance(db.get(HEALTH_KEY), dict):
         db[HEALTH_KEY] = {}
+    # proxy (pluggable, vault is source)
+    if not isinstance(db.get(PROXY_KEY), dict):
+        db[PROXY_KEY] = {}
+    db[PROXY_KEY].setdefault("type", DEFAULT_PROXY_TYPE)
+    if db[PROXY_KEY].get("type") not in PROXY_TYPES:
+        db[PROXY_KEY]["type"] = DEFAULT_PROXY_TYPE
+    db[PROXY_KEY].setdefault("routing", ROUTING_STRATEGY)
+    # harnesses (detected, not stored)
     # providers: normalize credentials + defaults
     for pid, pdata in list(db.items()):
         if pid.startswith("_"):
