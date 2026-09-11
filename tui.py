@@ -176,6 +176,46 @@ def format_limit(rpm: object, tpm: object, shared: int = 1) -> str | None:
     return txt
 
 
+def vault_table_rows(db: dict[str, Any], show_hidden: bool = False) -> list[dict[str, Any]]:
+    """Vault rows: provider / model / key snippet / status. Hidden by default."""
+    rows: list[dict[str, Any]] = []
+    for pid, pdata in db.items():
+        if pid.startswith("_") or not isinstance(pdata, dict):
+            continue
+        models = pdata.get("models") or []
+        creds = pdata.get("credentials") or []
+        for cred in creds:
+            if not isinstance(cred, dict):
+                continue
+            status = (cred.get("validation") or {}).get("status", "unknown")
+            # vault hidden: only active+throttled shown by default
+            if not show_hidden and status not in ("ok", "throttled"):
+                # map ok->active, throttled kept, others hidden
+                if status not in ("ok", "throttled"):
+                    continue
+            # normalize status to vault tags
+            vault_status = {"ok": "active", "throttled": "throttled", "invalid": "invalid", "expired": "expired"}.get(status, status)
+            health = vault_status
+            mark, word = HEALTH_DISPLAY.get({"active": "healthy", "throttled": "throttled", "invalid": "invalid", "expired": "invalid"}.get(health, "unknown"), ("?", health))
+            secret = cred.get("secret") or ""
+            suffix = engine.mask_secret(secret) if secret else "…" + cred.get("id","")[-4:]
+            for model in (models or ["—"]):
+                lat = engine.probe_latency(db, pid, model) if model != "—" else None
+                rows.append({
+                    "pool": model, "provider": pid, "upstream": model,
+                    "tier": "unknown", "rpm": None, "tpm": None,
+                    "quota_domain": cred.get("quota_domain",""),
+                    "quota": _short_quota(cred.get("quota_domain","")),
+                    "confidence": "", "shared": 1,
+                    "ctx_num": None, "ctx": "—",
+                    "latency": lat, "latency_txt": f"{lat:.1f}s" if lat else "—",
+                    "health": health, "health_txt": f"{mark} {word}",
+                    "health_rank": HEALTH_RANK.get(health, 9),
+                    "key": suffix, "credential_id": cred.get("id",""),
+                    "endpoint": pdata.get("base_url") or (pdata.get("endpoints") or ["—"])[0],
+                })
+    return sorted(rows, key=lambda r: (r["provider"], r["pool"]))
+
 def deployment_table_rows(db: dict[str, Any]) -> list[dict[str, Any]]:
     """One display row per compiled deployment (pure, no I/O, no secrets).
 
@@ -584,20 +624,22 @@ class HomeScreen(Screen):
             yield Label("Vault — active only (a to show hidden)", id="title")
             yield Static("", id="gateway-badge")
             yield Static("", id="sync-targets")
-            yield Input(placeholder="Filter pools/providers/models ( / to focus, x to clear )",
+            yield Input(placeholder="Filter vault provider/model/key ( / to focus, x to clear )",
                         id="home-filter")
             yield DataTable(id="models-table", cursor_type="row")
-            yield Static("a: show hidden • Enter: details • /: filter • P: probe",
+            yield Static("Vault: add API key + model • a: show hidden • /: filter • P: probe",
                          id="home-hint")
             yield Static("", id="home-attention")
-            yield Button("Configure", id="go-configure", variant="primary")
+            yield Button("Add to Vault", id="go-configure", variant="primary")
             yield Button("Probe all", id="probe-all")
             yield Button("Cancel", id="cancel-probe")
-            # Proxy is separate (p), harnesses are dynamic tabs
             yield Button("Proxy", id="go-proxy")
-            yield Button("Quota", id="go-quota")
-            # Dynamic harness buttons (opencode/jcode if detected)
-            yield Button("Import", id="go-import")
+            # Dynamic harness tabs (detected)
+            for h in engine.detect_harnesses():
+                yield Button(h.title(), id=f"go-{h}")
+            # Fallback static for compat/tests
+            if not engine.detect_harnesses():
+                yield Button("Harnesses", id="go-harness")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -622,13 +664,22 @@ class HomeScreen(Screen):
         app = self.app
         assert isinstance(app, WizardApp)
         overview = engine.gateway_overview(app.db, app.paths, status=app.status)
-        self.rows = deployment_table_rows(app.db)
+        # Vault is main: show vault rows, not deployments; proxy/harness separate
+        if getattr(self, "show_hidden", False):
+            self.rows = vault_table_rows(app.db, show_hidden=True)
+        else:
+            self.rows = vault_table_rows(app.db, show_hidden=False)
+        # Fallback to deployments if vault empty (for migration)
+        if not self.rows:
+            self.rows = deployment_table_rows(app.db)
         self.counts = summary_counts(self.rows)
-        badge = gateway_badge(overview, self.counts, self.probe_note)
+        # Proxy badge is proxy-agnostic
+        proxy_type = engine.get_proxy_type(app.db)
+        badge = f"{proxy_type} {gateway_badge(overview, self.counts, self.probe_note)}"
         self._apply_view()
         attention = overview.get("attention") or []
         if not self.rows and not attention:
-            attention = ["No models configured yet — choose Configure to add keys."]
+            attention = ["Vault empty — add API keys with models (Configure)."]
         attn_txt = ("Needs attention\n" + "\n".join(f"  ! {a}" for a in attention)) if attention else ""
         # Plain-text summary kept for tests / narrow terminals.
         self.last_content = "\n".join(
@@ -2578,7 +2629,6 @@ class ImportScreen(Screen):
             yield Button("Import from OpenCode", id="import-opencode",
                          variant="primary")
             yield Button("Import from JCode", id="import-jcode")
-            yield Button("OpenCode → JCode (direct)", id="import-opencode-to-jcode")
             yield Button("Back", id="back")
         yield Footer()
 
@@ -2638,33 +2688,6 @@ class ImportScreen(Screen):
             else:
                 note = "No custom provider profiles with models found."
             self.last_status = note
-        self._render_status()
-
-    @on(Button.Pressed, "#import-opencode-to-jcode")
-    def _import_opencode_to_jcode(self) -> None:
-        app = self.app
-        assert isinstance(app, WizardApp)
-        try:
-            result = _quiet_call(engine.import_opencode_to_jcode, app.paths, False, False)
-        except Exception as e:  # noqa: BLE001 -- report, don't crash
-            self.last_status = f"Import failed ({str(e)[:120]})"
-        else:
-            if not result.get("ok"):
-                self.last_status = f"Import failed: {result.get('note','unknown')}"
-                if result.get("skipped"):
-                    names = [s.get("name","?") for s in result["skipped"][:3]]
-                    self.last_status += f" (skipped: {', '.join(names)})"
-            elif result.get("imported"):
-                names = [r.get("name","?") for r in result["imported"]]
-                self.last_status = f"Imported {len(names)} provider(s) to JCode: {', '.join(names)}."
-                if result.get("skipped"):
-                    self.last_status += f" Skipped {len(result['skipped'])}."
-            else:
-                note = result.get("note") or "No providers imported."
-                if result.get("skipped"):
-                    names = [s.get("name","?") for s in result["skipped"][:3]]
-                    note += f" Skipped: {', '.join(names)}."
-                self.last_status = note
         self._render_status()
 
     def action_back(self) -> None:

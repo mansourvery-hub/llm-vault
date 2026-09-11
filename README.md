@@ -35,7 +35,7 @@ llm-vault  # TUI: Vault is main screen
 **CLI (same vault):**
 ```bash
 llm-vault --check
-wizard.py --import-opencode-to-jcode --dry-run  # now just vault → harness, no direct harness→harness
+vault is source of truth, no harness→harness
 ```
 
 ## Files

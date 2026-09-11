@@ -1180,13 +1180,26 @@ def validate_compiled_config(deployments, pools, roles):
 
 
 def compile_config(db):
-    """Full pipeline: DB -> deployments -> pools -> roles -> litellm dict."""
+    """Full pipeline: DB (vault + proxy) -> deployments -> pools -> roles -> proxy dict."""
     db = migrate_db(db)
     deployments = build_deployments(db)
     pools = build_model_pools(deployments)
     roles = build_roles(db, pools)
     errors = validate_compiled_config(deployments, pools, roles)
     return deployments, pools, roles, errors
+
+def get_proxy_type(db: dict[str, Any]) -> str:
+    """Proxy type from vault DB, not hardcoded. tui must use this."""
+    p = db.get(PROXY_KEY) if isinstance(db.get(PROXY_KEY), dict) else {}
+    t = p.get("type") if isinstance(p, dict) else None
+    return t if t in PROXY_TYPES else DEFAULT_PROXY_TYPE
+
+def set_proxy_type(db: dict[str, Any], proxy_type: str) -> None:
+    if proxy_type not in PROXY_TYPES:
+        raise ValueError(f"unknown proxy: {proxy_type}")
+    if not isinstance(db.get(PROXY_KEY), dict):
+        db[PROXY_KEY] = {}
+    db[PROXY_KEY]["type"] = proxy_type
 
 
 def deployment_diff(old_deps, new_deps):
@@ -4217,58 +4230,6 @@ def import_jcode_now(db):
     print("  [+] Imported. Validate keys from the provider screen, then Q to compile.")
 
 
-def import_opencode_to_jcode_now(dry_run=False, overwrite=False):
-    """CLI: import OpenCode provider config directly into JCode (no DB)."""
-    print("\n--- Import OpenCode -> JCode ---")
-    try:
-        import engine as _engine
-        result = _engine.import_opencode_to_jcode(dry_run=dry_run, overwrite=overwrite)
-    except Exception as e:  # noqa: BLE001 -- report, don't crash
-        print(f"  [!] Import failed: {str(e)[:200]}")
-        return False
-    if not result.get("ok"):
-        print(f"  [!] {result.get('note', 'import failed')}")
-        if result.get("skipped"):
-            for s in result["skipped"][:5]:
-                print(f"    - {s.get('name')}: {s.get('reason')}")
-        return False
-    if result.get("gateway_models"):
-        print(f"  [=] Skipped {len(result['gateway_models'])} gateway model(s) (litellm -> localhost:4000).")
-    imported = result.get("imported", [])
-    skipped = result.get("skipped", [])
-    if dry_run:
-        print(f"  [dry-run] would import {len(imported)} provider(s):")
-        for r in imported:
-            env_note = f" via {r.get('api_key_env')}" if r.get("api_key_env") else " (no api key)"
-            print(f"    + {r.get('name')} -> {r.get('base_url')} [{len(r.get('models', []))} models]{env_note}")
-        if skipped:
-            print(f"  [dry-run] would skip {len(skipped)}:")
-            for s in skipped[:6]:
-                print(f"    - {s.get('name')}: {s.get('reason')}")
-        return True
-    if not imported:
-        print("  [i] No providers imported.")
-        if skipped:
-            print(f"  Skipped {len(skipped)}:")
-            for s in skipped[:6]:
-                print(f"    - {s.get('name')}: {s.get('reason')}")
-        return True
-    for r in imported:
-        env_note = f" env:{r.get('api_key_env')}" if r.get("api_key_env") else ""
-        print(f"  [+] {r.get('name')}: {r.get('base_url')} [{len(r.get('models', []))} models]{env_note}")
-        if r.get("env_file"):
-            print(f"      env file: ~/.config/jcode/{r['env_file']} (0600)")
-    if skipped:
-        print(f"  [i] Skipped {len(skipped)}:")
-        for s in skipped[:6]:
-            print(f"    - {s.get('name')}: {s.get('reason')}")
-    if result.get("backup"):
-        print(f"  [+] Backup: {result['backup']}")
-    print("  [+] Done. Try: jcode --provider-profile <name> --model <id> run 'hello'")
-    print("  [i] Validate: jcode provider list ; jcode --provider-profile <name> auth-test")
-    return True
-
-
 def _resolve_pid(db, text):
     num, res = resolve_provider(text, db)
     if num == "C" and isinstance(res, dict):
@@ -4390,9 +4351,7 @@ def show_help():
     jcode import    adopt an existing JCode provider config into the wizard
     import          adopt an existing OpenCode provider config into the wizard
     opencode        sync logical models into opencode.json
-    opencode-to-jcode  copy providers/models from opencode.json -> jcode
-                   (direct, no gateway: opencode providers become jcode profiles)
-                   flags: --dry-run (preview), --overwrite (update existing)
+    # vault is source of truth — no direct opencode→jcode; harnesses import from vault
 
   Words you'll see:
     key       one API key you pasted in.
@@ -4428,10 +4387,6 @@ def main():
         db = load_db()
         import_jcode_now(db)
         sys.exit(0)
-    if "--import-opencode-to-jcode" in sys.argv or "--opencode-to-jcode" in sys.argv or "--opencode2jcode" in sys.argv:
-        ok = import_opencode_to_jcode_now(dry_run="--dry-run" in sys.argv,
-                                           overwrite="--overwrite" in sys.argv)
-        sys.exit(0 if ok else 1)
     db = load_db()
     cleaned, emptied = normalize_aliases(db)
     if cleaned:
@@ -4514,13 +4469,6 @@ def main():
         if low in ("import opencode", "opencode import", "import"):
             import_opencode_now(db)
             db = load_db()
-            continue
-        if low in ("opencode-to-jcode", "opencode2jcode", "import opencode to jcode",
-                   "opencode to jcode", "opencode->jcode"):
-            import_opencode_to_jcode_now()
-            continue
-        if low in ("opencode-to-jcode --dry-run", "opencode-to-jcode dry-run"):
-            import_opencode_to_jcode_now(dry_run=True)
             continue
         if low in ("sync opencode", "opencode sync", "opencode"):
             maybe_sync_opencode()
