@@ -2563,7 +2563,7 @@ class ImportScreen(Screen):
 # ------------------------------------------------------------------ app ---
 
 class WizardApp(App):
-    TITLE = "LLM Proxy Wizard"
+    TITLE = "LLM Vault"
     SUB_TITLE = f"v{engine.__version__}"
     CSS = """
     #body { width: 1fr; height: auto; margin: 1 2; }
