@@ -692,12 +692,12 @@ def harness_delete(paths: EnginePaths | None = None, harness: str = "", keep_fre
 def harness_import_from_vault(paths: EnginePaths | None = None, harness: str = "", selected: list[tuple[str, str]] | None = None) -> dict[str, Any]:
     """Import vault working keys into one harness (vault is source).
 
-    selected is None → all working (ok/throttled); else list of (provider,model) to pick.
-    Only working keys are sent; dead keys never leave vault. One harness at a time.
+    selected is None → all working (ok/throttled); else list of (provider,model) to pick (one harness at a time).
+    Only working keys are sent; dead keys never leave vault. No harness→harness.
     """
     p = _resolve_paths(paths)
     db = load_state(p)
-    # build filtered view: only working creds
+    # Determine working credential ids
     working_ids: set[str] = set()
     for pid, pdata in db.items():
         if pid.startswith("_") or not isinstance(pdata, dict):
@@ -706,22 +706,70 @@ def harness_import_from_vault(paths: EnginePaths | None = None, harness: str = "
             st = (c.get("validation") or {}).get("status", "unknown")
             if st in ("ok", "throttled"):
                 working_ids.add(c.get("id"))
-    # If selected, filter models
-    if selected is not None:
-        wanted = set(selected)
-        # filtered_db will be used to generate harness-specific pools
-        # For now, we just count; actual sync will use the full vault but harness sync itself filters to working
-        pass
-    # For minimal, we just sync the current gateway pools (which are already working-only via compile)
-    # The harness sync modules already only sync active pools (from config.yaml), which are working.
-    # So we can just call the existing sync with the current DB (which already reflects working).
-    # The key is we never send dead keys.
-    if harness == "opencode":
-        res = sync_opencode(p, dry_run=False)
-        return {"harness": harness, "imported": len(working_ids), "res": res}
-    if harness == "jcode":
-        res = sync_jcode(p, dry_run=False)
-        return {"harness": harness, "imported": len(working_ids), "res": res}
+    # Build filtered view for harness: keep only working creds, and if selected filter models
+    filtered_db = json.loads(json.dumps(db))
+    for pid in list(filtered_db.keys()):
+        if pid.startswith("_"):
+            continue
+        if not isinstance(filtered_db[pid], dict):
+            continue
+        # filter credentials to working only
+        creds = [c for c in filtered_db[pid].get("credentials", []) if c.get("id") in working_ids]
+        filtered_db[pid]["credentials"] = creds
+        filtered_db[pid]["keys"] = [c.get("secret","") for c in creds if c.get("secret")]
+        # filter models if selected
+        if selected is not None:
+            wanted_models = {m for (pp, m) in selected if pp == pid}
+            if wanted_models:
+                # keep only wanted models that are in provider
+                filtered_db[pid]["models"] = [m for m in filtered_db[pid].get("models", []) if m in wanted_models]
+            elif selected is not None and not any(pp == pid for pp, _ in selected):
+                # this provider not in selected list → no models
+                filtered_db[pid]["models"] = []
+    # Now sync harness with filtered DB (write via temp DB file)
+    import tempfile as _tf
+    with _tf.NamedTemporaryFile(mode="w", delete=False, suffix=".json") as tf:
+        json.dump(filtered_db, tf)
+        tf_path = tf.name
+    # Use wizard's DB_FILE override to compile filtered
+    old_db = _wiz.DB_FILE
+    _wiz.DB_FILE = tf_path
+    try:
+        # compile filtered to get pools, then sync harness via its sync module using that pools
+        # For opencode/jcode, sync reads from config.yaml, not DB directly, so we need to generate a temp yaml
+        # Simplify: directly call harness sync with filtered DB's pools via a temp yaml
+        # For minimal, we will generate a temp config.yaml from filtered DB and then sync
+        import yaml as _yaml
+        from wizard import generate_yaml as _gen
+        # Generate temp yaml
+        with _tf.NamedTemporaryFile(mode="w", delete=False, suffix=".yaml") as yf:
+            yf_path = yf.name
+        old_yaml = _wiz.YAML_FILE
+        _wiz.YAML_FILE = yf_path
+        try:
+            _gen(filtered_db)
+            # Now sync harness using that temp yaml
+            if harness == "opencode":
+                # sync-opencode reads from yaml path via EnginePaths, so we need to patch paths
+                tmp_paths = EnginePaths(db_file=tf_path, yaml_file=yf_path, secret_file=p.secret_file, opencode_json=p.opencode_json, jcode_config=p.jcode_config)
+                res = sync_opencode(tmp_paths, dry_run=False)
+                return {"harness": harness, "imported": len(working_ids), "selected": len(selected) if selected is not None else None, "res": res}
+            if harness == "jcode":
+                tmp_paths = EnginePaths(db_file=tf_path, yaml_file=yf_path, secret_file=p.secret_file, opencode_json=p.opencode_json, jcode_config=p.jcode_config)
+                res = sync_jcode(tmp_paths, dry_run=False)
+                return {"harness": harness, "imported": len(working_ids), "selected": len(selected) if selected is not None else None, "res": res}
+        finally:
+            _wiz.YAML_FILE = old_yaml
+            try:
+                os.unlink(yf_path)
+            except OSError:
+                pass
+    finally:
+        _wiz.DB_FILE = old_db
+        try:
+            os.unlink(tf_path)
+        except OSError:
+            pass
     return {"harness": harness, "imported": 0, "note": "unknown harness"}
 
 

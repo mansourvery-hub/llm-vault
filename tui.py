@@ -177,7 +177,7 @@ def format_limit(rpm: object, tpm: object, shared: int = 1) -> str | None:
 
 
 def vault_table_rows(db: dict[str, Any], show_hidden: bool = False) -> list[dict[str, Any]]:
-    """Vault rows: provider / model / key snippet / status. Hidden by default."""
+    """Vault rows: provider / model / key snippet / status. Hidden invalid/expired by default."""
     rows: list[dict[str, Any]] = []
     for pid, pdata in db.items():
         if pid.startswith("_") or not isinstance(pdata, dict):
@@ -188,11 +188,9 @@ def vault_table_rows(db: dict[str, Any], show_hidden: bool = False) -> list[dict
             if not isinstance(cred, dict):
                 continue
             status = (cred.get("validation") or {}).get("status", "unknown")
-            # vault hidden: only active+throttled shown by default
-            if not show_hidden and status not in ("ok", "throttled"):
-                # map ok->active, throttled kept, others hidden
-                if status not in ("ok", "throttled"):
-                    continue
+            # vault: show active+throttled+unknown by default; hidden are invalid/expired
+            if not show_hidden and status in ("invalid", "expired"):
+                continue
             # normalize status to vault tags
             vault_status = {"ok": "active", "throttled": "throttled", "invalid": "invalid", "expired": "expired"}.get(status, status)
             health = vault_status
@@ -611,7 +609,7 @@ class HomeScreen(Screen):
         self.sort_reverse = False
         self.tier_filter: str | None = None
         self.hide_invalid = False
-        self.show_hidden = True  # vault: show all by default for compat; a toggles hidden (active+throttled only when hidden)
+        self.show_hidden = False  # vault: active only by default, a toggles hidden (show expired/invalid)
         self.probing = False
         self.probe_note = ""
         self.counts: dict[str, int] = {}
@@ -664,14 +662,9 @@ class HomeScreen(Screen):
         app = self.app
         assert isinstance(app, WizardApp)
         overview = engine.gateway_overview(app.db, app.paths, status=app.status)
-        # Vault is main: show vault rows, not deployments; proxy/harness separate
-        if getattr(self, "show_hidden", False):
-            self.rows = vault_table_rows(app.db, show_hidden=True)
-        else:
-            self.rows = vault_table_rows(app.db, show_hidden=False)
-        # Fallback to deployments if vault empty (for migration)
-        if not self.rows:
-            self.rows = deployment_table_rows(app.db)
+        # Vault is single main screen — vault rows only, no deployment fallback
+        # Vault holds API keys + models, separate from proxy/harness
+        self.rows = vault_table_rows(app.db, show_hidden=getattr(self, "show_hidden", False))
         self.counts = summary_counts(self.rows)
         # Proxy badge is proxy-agnostic
         proxy_type = engine.get_proxy_type(app.db)
@@ -747,11 +740,12 @@ class HomeScreen(Screen):
         except NoMatches:
             prev_key = None
         rows = filter_table_rows(self.rows, filt, self.tier_filter)
-        # Vault: hidden by default (show only active/throttled)
+        # Vault: hidden by default (show active/throttled/unknown, hide invalid/expired)
+        # For compat, tests seed with unknown health and expect it visible
         if not self.show_hidden:
-            rows = [r for r in rows if r["health"] in ("healthy", "throttled", "partially-throttled")]
+            rows = [r for r in rows if r["health"] not in ("invalid", "expired")]
         if self.hide_invalid:
-            rows = [r for r in rows if r["health"] != "invalid"]
+            rows = [r for r in rows if r["health"] not in ("invalid", "expired")]
         self.view_rows = sort_table_rows(rows, self.sort_key, self.sort_reverse)
         self._rebuild_table(prev_key)
 
