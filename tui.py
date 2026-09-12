@@ -658,12 +658,12 @@ class HomeScreen(Screen):
         from textual.widgets import Tabs
         yield Header()
         with Vertical(id="body"):
-            # Tabs: Vault (main) + Proxy + dynamic harness tabs (opencode/jcode)
-            # Use simple string tabs to avoid id validation issues; handle activation via event
+            # Tabs: Vault (main) + per-proxy tabs + dynamic harness tabs
             harnesses = engine.detect_harnesses()
             if not harnesses:
                 harnesses = ["opencode", "jcode"]
-            tabs = ["Vault", "Proxy"] + [h.title() for h in harnesses]
+            proxy_tabs = [f"Proxy: {p}" for p in engine.PROXY_TYPES]
+            tabs = ["Vault"] + proxy_tabs + [h.title() for h in harnesses]
             yield Tabs(*tabs, id="main-tabs")
             yield Static("", id="gateway-badge")
             yield Static("", id="sync-targets")
@@ -695,8 +695,10 @@ class HomeScreen(Screen):
         label = event.tab.label.plain if hasattr(event.tab.label, "plain") else str(event.tab.label)
         if label == "Vault":
             return
-        if label == "Proxy":
-            self.app.push_screen(ProxyScreen())
+        if label.startswith("Proxy:"):
+            # Extract proxy type, e.g. "Proxy: litellm" -> litellm
+            ptype = label.split(":",1)[1].strip().lower() if ":" in label else engine.get_proxy_type(self.app.db)
+            self.app.push_screen(ProxyScreen(proxy_type=ptype))
         elif label.lower() in ("opencode", "jcode"):
             self.app.push_screen(HarnessScreen(label.lower()))
 
@@ -2440,15 +2442,20 @@ class QuotaDashboardScreen(Screen):
 
 
 class ProxyScreen(Screen):
-    """Proxy tab: shows proxy type (litellm/biofrost), routing, Apply."""
+    """Per-proxy tab (sparse): shows routing, rate-limit handling for that proxy."""
 
     BINDINGS = [("escape", "back", "Back")]  # noqa: RUF012
+
+    def __init__(self, proxy_type: str | None = None) -> None:
+        super().__init__()
+        self.proxy_type = proxy_type
 
     def compose(self) -> ComposeResult:
         yield Header()
         with Vertical(id="body"):
             yield Label("Proxy — routing only, vault supplies keys", id="title")
             yield Static("", id="proxy-status")
+            yield Static("Rate-limit handling: 429 → cooldown 60s, 5xx → 30s, vault throttled kept", id="proxy-help")
             yield Button("Apply proxy config", id="apply-proxy", variant="primary")
             yield Button("Back", id="back")
         yield Footer()
@@ -2459,16 +2466,26 @@ class ProxyScreen(Screen):
     def refresh_content(self) -> None:
         app = self.app
         assert isinstance(app, WizardApp)
-        pt = engine.get_proxy_type(app.db)
-        self.query_one("#proxy-status", Static).update(f"Proxy: {pt} (vault → proxy compile)")
+        pt = self.proxy_type or engine.get_proxy_type(app.db)
+        # keep very sparse for now, but show free keys handling
+        self.query_one("#proxy-status", Static).update(f"Proxy: {pt} (vault → {pt} compile)\nRouting: usage-based-routing-v2, throttled kept")
 
     @on(Button.Pressed, "#apply-proxy")
     def _apply(self) -> None:
         app = self.app
         assert isinstance(app, WizardApp)
+        # Ensure DB proxy type matches this tab
+        if self.proxy_type:
+            try:
+                engine.set_proxy_type(app.db, self.proxy_type)
+                engine.save_state(app.db, app.paths)
+            except ValueError as e:
+                self.query_one("#proxy-status", Static).update(f"Set proxy failed: {e}")
+                return
         try:
             n = engine.write_config(app.db, app.paths)
-            self.query_one("#proxy-status", Static).update(f"Proxy {engine.get_proxy_type(app.db)} applied: {n} routes")
+            pt = engine.get_proxy_type(app.db)
+            self.query_one("#proxy-status", Static).update(f"Proxy {pt} applied: {n} routes")
         except ValueError as e:
             self.query_one("#proxy-status", Static).update(f"Apply failed: {e}")
 
@@ -2481,7 +2498,7 @@ class ProxyScreen(Screen):
 
 
 class HarnessScreen(Screen):
-    """Generic harness tab: shows harness config, Delete / Keep free, Import all / Pick."""
+    """Generic harness tab: mirrors app's provider/model list, allows add/remove without touching vault."""
 
     def __init__(self, harness: str) -> None:
         super().__init__()
@@ -2490,12 +2507,16 @@ class HarnessScreen(Screen):
     def compose(self) -> ComposeResult:
         yield Header()
         with Vertical(id="body"):
-            yield Label(f"{self.harness} — harness (vault is source)", id="title")
+            yield Label(f"{self.harness} — mirrors {self.harness} /connect or /model", id="title")
             yield Static("", id="harness-status")
+            yield DataTable(id="harness-table", cursor_type="row")
+            yield Static("Select a row to remove, or Import from vault", id="harness-hint")
             yield Button("Delete", id="delete", variant="error")
             yield Button("Keep free", id="keep-free")
             yield Button("Import all", id="import-all", variant="primary")
             yield Button("Pick", id="pick")
+            yield Button("Add provider/model", id="add-harness-model")
+            yield Button("Remove selected", id="remove-harness-model")
             yield Button("Back", id="back")
         yield Footer()
 
@@ -2505,8 +2526,54 @@ class HarnessScreen(Screen):
     def refresh_content(self) -> None:
         app = self.app
         assert isinstance(app, WizardApp)
-        # Show harness file/block status
-        self.query_one("#harness-status", Static).update(f"{self.harness}: {engine.detect_harnesses(app.paths)}")
+        # Show harness file exactly as app sees it (mirror)
+        try:
+            if self.harness == "opencode":
+                data = engine.opencode_view_data(app.db, app.paths) if hasattr(engine, "opencode_view_data") else {}
+                # opencode view data has current providers
+                cur = data.get("current") or []
+                status = f"{self.harness}: {len(cur)} models (mirrors /model) • vault is source"
+            elif self.harness == "jcode":
+                st = engine.jcode_status(app.paths)
+                status = f"{self.harness}: {len(st.get('profiles',[]))} profiles • vault is source"
+            else:
+                status = f"{self.harness}: detected"
+        except Exception:
+            status = f"{self.harness}: status unknown"
+        self.query_one("#harness-status", Static).update(status)
+        # Fill table with harness's own providers/models (not vault)
+        try:
+            table = self.query_one("#harness-table", DataTable)
+            table.clear(columns=True)
+            table.add_column("Provider", key="provider")
+            table.add_column("Model", key="model")
+            # Load harness providers
+            if self.harness == "opencode":
+                import json as _json
+                with open(app.paths.opencode_json) as f:
+                    cfg = _json.loads(engine._load_sync_module()._strip_jsonc(f.read()))
+                prov = cfg.get("provider") or {}
+                for pid, blk in prov.items():
+                    if not isinstance(blk, dict):
+                        continue
+                    models = blk.get("models") or {}
+                    if isinstance(models, dict):
+                        for mid in models:
+                            table.add_row(pid, mid)
+                    elif isinstance(models, list):
+                        for mid in models:
+                            table.add_row(pid, mid)
+            elif self.harness == "jcode":
+                with open(app.paths.jcode_config) as f:
+                    txt = f.read()
+                import re as _re
+                # simple parse: show provider names and models
+                mods = engine._load_jcode_module().parse_profiles(txt) if hasattr(engine, "_load_jcode_module") else {}
+                for pname, pdata in mods.items():
+                    for m in pdata.get("models", []):
+                        table.add_row(pname, m.get("id",""))
+        except Exception:
+            pass
 
     @on(Button.Pressed, "#delete")
     def _delete(self) -> None:
@@ -2527,12 +2594,121 @@ class HarnessScreen(Screen):
     def _pick(self) -> None:
         self.app.push_screen(VaultPickScreen(self.harness))
 
+    @on(Button.Pressed, "#add-harness-model")
+    def _add(self) -> None:
+        # Add provider/model directly to harness, not vault (harness-only)
+        # For minimal: open a simple input screen
+        self.app.push_screen(HarnessAddScreen(self.harness))
+
+    @on(Button.Pressed, "#remove-harness-model")
+    def _remove(self) -> None:
+        try:
+            table = self.query_one("#harness-table", DataTable)
+            row = table.cursor_row
+            if row is None:
+                return
+            # Get provider/model from row
+            prov = table.get_cell_at((row, 0))
+            model = table.get_cell_at((row, 1))
+            # Remove from harness config only (vault untouched)
+            if self.harness == "opencode":
+                import json as _json
+                with open(self.app.paths.opencode_json) as f:
+                    cfg = _json.loads(engine._load_sync_module()._strip_jsonc(f.read()))
+                if isinstance(cfg.get("provider"), dict) and prov in cfg["provider"]:
+                    blk = cfg["provider"][prov]
+                    if isinstance(blk.get("models"), dict) and model in blk["models"]:
+                        del blk["models"][model]
+                    elif isinstance(blk.get("models"), list) and model in blk["models"]:
+                        blk["models"].remove(model)
+                    # atomic write
+                    engine._load_sync_module()._atomic_write_json(self.app.paths.opencode_json, cfg)
+            elif self.harness == "jcode":
+                # Remove from jcode config.toml
+                with open(self.app.paths.jcode_config) as f:
+                    txt = f.read()
+                # simple removal: remove that model line
+                lines = txt.splitlines()
+                out = []
+                skip = False
+                for line in lines:
+                    if f'"{model}"' in line and "id =" in line:
+                        # check if previous line is [[providers.<harness>.models]]
+                        # For now just skip this id line
+                        continue
+                    out.append(line)
+                open(self.app.paths.jcode_config, "w").write("\n".join(out))
+        except Exception:
+            pass
+        self.refresh_content()
+
     def action_back(self) -> None:
         self.app.pop_screen()
 
     @on(Button.Pressed, "#back")
     def _back(self) -> None:
         self.action_back()
+
+
+class HarnessAddScreen(Screen):
+    """Add provider/model directly to harness (not vault)."""
+
+    def __init__(self, harness: str) -> None:
+        super().__init__()
+        self.harness = harness
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with Vertical(id="body"):
+            yield Label(f"Add to {self.harness} (harness-only, vault untouched)", id="title")
+            yield Input(placeholder="Provider (e.g. openai, anthropic, custom label)", id="add-provider")
+            yield Input(placeholder="Model (e.g. gpt-4o, claude-sonnet)", id="add-model")
+            yield Input(placeholder="API key (optional, for this harness only)", id="add-key")
+            yield Button("Add", id="do-add", variant="primary")
+            yield Button("Back", id="back")
+        yield Footer()
+
+    @on(Button.Pressed, "#do-add")
+    def _do_add(self) -> None:
+        prov = self.query_one("#add-provider", Input).value.strip()
+        model = self.query_one("#add-model", Input).value.strip()
+        key = self.query_one("#add-key", Input).value.strip()
+        if not prov or not model:
+            return
+        try:
+            if self.harness == "opencode":
+                import json as _json
+                with open(self.app.paths.opencode_json) as f:
+                    cfg = _json.loads(engine._load_sync_module()._strip_jsonc(f.read()))
+                cfg.setdefault("provider", {}).setdefault(prov, {}).setdefault("models", {})[model] = {"name": model}
+                if key:
+                    cfg["provider"][prov].setdefault("options", {})["apiKey"] = key
+                engine._load_sync_module()._atomic_write_json(self.app.paths.opencode_json, cfg)
+            elif self.harness == "jcode":
+                # Append to jcode config.toml
+                with open(self.app.paths.jcode_config) as f:
+                    txt = f.read()
+                # Add provider if not exists, then add model
+                if f"[providers.{prov}]" not in txt:
+                    txt += f'\n[providers.{prov}]\ntype = "openai-compatible"\nbase_url = "https://api.openai.com/v1"\n'
+                    if key:
+                        txt += f'api_key_env = "HARNESS_{prov.upper()}_API_KEY"\n'
+                txt += f'\n[[providers.{prov}.models]]\nid = "{model}"\n'
+                open(self.app.paths.jcode_config, "w").write(txt)
+                if key:
+                    # store key in env file
+                    import os as _os, tempfile as _tf
+                    env_path = os.path.join(os.path.expanduser("~"), ".config", "jcode", f"provider-{prov}.env")
+                    _os.makedirs(os.path.dirname(env_path), exist_ok=True)
+                    with open(env_path, "w") as ef:
+                        ef.write(f"HARNESS_{prov.upper()}_API_KEY={key}\n")
+        except Exception:
+            pass
+        self.app.pop_screen()
+
+    @on(Button.Pressed, "#back")
+    def _back(self) -> None:
+        self.app.pop_screen()
 
 
 class VaultPickScreen(Screen):

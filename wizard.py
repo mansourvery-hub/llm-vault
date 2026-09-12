@@ -6,7 +6,7 @@ credentials + model capabilities + quota domains + routing policy into
 LiteLLM YAML. LiteLLM remains the runtime router; this wizard is the
 control plane / configuration compiler.
 """
-__version__ = "3.5.0"
+__version__ = "3.6.0"
 SCHEMA_VERSION = 2
 import datetime
 import hashlib
@@ -1216,19 +1216,20 @@ def deployment_diff(old_deps, new_deps):
 
 
 def generate_yaml(db_data, _prev_deployments=None):
-    """Compile DB -> LiteLLM YAML. Stages:
-
-    DB -> migrate/normalize -> credentials -> quota domains -> model
-    metadata -> deployments -> logical pools -> role aliases ->
-    routing/fallback policy -> LiteLLM YAML.
-
-    Guarantees: no duplicate deployments, no stale members, no empty
-    aliases, no roles pointing at missing pools, no missing credentials,
-    no empty endpoints, no alias collisions, only router options verified
-    against the installed LiteLLM, secrets never logged.
-    Raises ValueError (leaving config.yaml untouched) on violations.
-    Returns the number of emitted routes.
-    """
+    """Compile DB -> proxy config (vault → proxy). Litellm or biofrost."""
+    proxy_type = get_proxy_type(db_data)
+    if proxy_type == "biofrost":
+        # Biofrost is planned — for now generate a minimal biofrost.json stub
+        # Vault → proxy separation: proxy holds routing, vault holds keys
+        deployments, pools, roles, errors = compile_config(db_data)
+        if errors:
+            raise ValueError("refusing to write broken config: " + "; ".join(errors[:8]))
+        # For now, biofrost uses same model_list but different file; keep sparse
+        biofrost_path = os.environ.get("BIOFROST_JSON", os.path.join(CONFIG_DIR, "biofrost.json"))
+        data = {"proxy": "biofrost", "models": list(pools.keys()), "routing": db_data.get(PROXY_KEY, {}).get("routing", ROUTING_STRATEGY)}
+        _atomic_write_json(biofrost_path, data)
+        return len(pools)
+    # Default: litellm
     deployments, pools, roles, errors = compile_config(db_data)
     if errors:
         raise ValueError("refusing to write broken config: " + "; ".join(errors[:8]))
