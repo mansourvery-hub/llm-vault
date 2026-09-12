@@ -658,11 +658,16 @@ class HomeScreen(Screen):
         from textual.widgets import Tabs
         yield Header()
         with Vertical(id="body"):
-            # Tabs: Vault (main) + per-proxy tabs (only installed) + dynamic harness tabs
-            harnesses = engine.detect_harnesses()
-            if not harnesses:
-                harnesses = ["opencode", "jcode"]
-            proxy_tabs = [f"Proxy: {p}" for p in engine.detect_proxies()]
+            # Tabs: Vault (main) + per-proxy tabs (only installed) + dynamic harness tabs (no fallback)
+            try:
+                # Use app.paths if available (tests use temp paths), else env
+                _paths = self.app.paths if hasattr(self, "app") and hasattr(self.app, "paths") else None
+                harnesses = engine.detect_harnesses(_paths)
+                proxy_list = engine.detect_proxies(_paths)
+            except Exception:
+                harnesses = engine.detect_harnesses()
+                proxy_list = engine.detect_proxies()
+            proxy_tabs = [f"Proxy: {p}" for p in proxy_list]
             tabs = ["Vault"] + proxy_tabs + [h.title() for h in harnesses]
             yield Tabs(*tabs, id="main-tabs")
             yield Static("", id="gateway-badge")
@@ -706,12 +711,18 @@ class HomeScreen(Screen):
     def on_screen_resume(self) -> None:
         self.refresh_content()
         self._focus_table()
-        # Reset tabs so re-clicking harness works
+        # Reset tabs so re-clicking same harness fires again (Tabs only fires on change)
+        def _reset_tabs() -> None:
+            try:
+                tabs = self.query_one("#main-tabs", Tabs)
+                # avoid triggering push for Vault (handler returns early)
+                tabs.active = "Vault"
+            except Exception:
+                pass
         try:
-            tabs = self.query_one("#main-tabs", Tabs)
-            tabs.active = "Vault"
+            self.set_timer(0.05, _reset_tabs)
         except Exception:
-            pass
+            _reset_tabs()
 
     # -- data --
 
@@ -2515,8 +2526,9 @@ class ProxyScreen(Screen):
             yield Label("Retry: try all providers in group before failing", id="proxy-retry-label")
             yield SelectionList(id="proxy-retry-list")
             yield Static("Rate-limit handling: 429 → cooldown 60s, 5xx → 30s, vault throttled kept", id="proxy-help")
-            yield Button("Apply proxy config", id="apply-proxy", variant="primary")
-            yield Button("Back", id="back")
+            with Horizontal(id="proxy-actions"):
+                yield Button("Apply proxy config", id="apply-proxy", variant="primary")
+                yield Button("Back", id="back")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -2630,48 +2642,69 @@ class HarnessScreen(Screen):
     def refresh_content(self) -> None:
         app = self.app
         assert isinstance(app, WizardApp)
-        # Show harness file exactly as app sees it (mirror)
         try:
             if self.harness == "opencode":
-                data = engine.opencode_view_data(app.db, app.paths) if hasattr(engine, "opencode_view_data") else {}
-                # opencode view data has current providers
-                cur = data.get("current") or []
-                status = f"{self.harness}: {len(cur)} models (mirrors /model) • vault is source"
+                import json as _json
+                with open(app.paths.opencode_json) as f:
+                    cfg = _json.loads(engine._load_sync_module()._strip_jsonc(f.read()))
+                # Merge both provider locations (legacy "provider" + new "providers")
+                merged = {}
+                for key in ("provider", "providers"):
+                    blk = cfg.get(key)
+                    if isinstance(blk, dict):
+                        for k, v in blk.items():
+                            merged[k] = v
+                count_models = 0
+                for v in merged.values():
+                    if isinstance(v, dict):
+                        m = v.get("models")
+                        if isinstance(m, dict):
+                            count_models += len(m)
+                        elif isinstance(m, list):
+                            count_models += len(m)
+                status = f"{self.harness}: {len(merged)} provider(s), {count_models} models (mirrors /model) • vault is source"
             elif self.harness == "jcode":
                 st = engine.jcode_status(app.paths)
-                status = f"{self.harness}: {len(st.get('profiles',[]))} profiles • vault is source"
+                status = f"{self.harness}: {len(st.get('profiles',[]))} profile(s) • vault is source"
             else:
                 status = f"{self.harness}: detected"
         except Exception:
             status = f"{self.harness}: status unknown"
-        self.query_one("#harness-status", Static).update(status)
-        # Fill table with harness's own providers/models (not vault)
+        try:
+            self.query_one("#harness-status", Static).update(status)
+        except Exception:
+            pass
         try:
             table = self.query_one("#harness-table", DataTable)
             table.clear(columns=True)
             table.add_column("Provider", key="provider")
             table.add_column("Model", key="model")
-            # Load harness providers
             if self.harness == "opencode":
                 import json as _json
                 with open(app.paths.opencode_json) as f:
                     cfg = _json.loads(engine._load_sync_module()._strip_jsonc(f.read()))
-                prov = cfg.get("provider") or {}
-                for pid, blk in prov.items():
-                    if not isinstance(blk, dict):
+                # Show both locations
+                for key in ("provider", "providers"):
+                    prov = cfg.get(key) or {}
+                    if not isinstance(prov, dict):
                         continue
-                    models = blk.get("models") or {}
-                    if isinstance(models, dict):
-                        for mid in models:
-                            table.add_row(pid, mid)
-                    elif isinstance(models, list):
-                        for mid in models:
-                            table.add_row(pid, mid)
+                    for pid, blk in prov.items():
+                        if not isinstance(blk, dict):
+                            continue
+                        models = blk.get("models") or {}
+                        if isinstance(models, dict):
+                            for mid in models:
+                                table.add_row(pid, mid)
+                        elif isinstance(models, list):
+                            for mid in models:
+                                # list item may be string
+                                if isinstance(mid, str):
+                                    table.add_row(pid, mid)
+                                else:
+                                    table.add_row(pid, str(mid))
             elif self.harness == "jcode":
                 with open(app.paths.jcode_config) as f:
                     txt = f.read()
-                import re as _re
-                # simple parse: show provider names and models
                 mods = engine._load_jcode_module().parse_profiles(txt) if hasattr(engine, "_load_jcode_module") else {}
                 for pname, pdata in mods.items():
                     for m in pdata.get("models", []):
@@ -2681,17 +2714,36 @@ class HarnessScreen(Screen):
 
     @on(Button.Pressed, "#delete")
     def _delete(self) -> None:
-        engine.harness_delete(self.app.paths, self.harness, keep_free=False)
+        try:
+            res = engine.harness_delete(self.app.paths, self.harness, keep_free=False)
+            st = "deleted" if res.get("deleted") else res.get("note","")
+            self.query_one("#harness-status", Static).update(f"{self.harness}: {st} • vault untouched")
+        except Exception as e:
+            self.query_one("#harness-status", Static).update(f"{self.harness}: delete failed {e}")
         self.refresh_content()
 
     @on(Button.Pressed, "#keep-free")
     def _keep(self) -> None:
-        engine.harness_delete(self.app.paths, self.harness, keep_free=True)
+        try:
+            res = engine.harness_delete(self.app.paths, self.harness, keep_free=True)
+            st = "keep free" if res.get("deleted") else res.get("note","")
+            self.query_one("#harness-status", Static).update(f"{self.harness}: {st} (keep free) • vault untouched")
+        except Exception as e:
+            self.query_one("#harness-status", Static).update(f"{self.harness}: keep-free failed {e}")
         self.refresh_content()
 
     @on(Button.Pressed, "#import-all")
     def _all(self) -> None:
-        engine.harness_import_from_vault(self.app.paths, self.harness, None)
+        try:
+            res = engine.harness_import_from_vault(self.app.paths, self.harness, None)
+            imported = res.get("imported", 0)
+            note = res.get("note","")
+            if imported:
+                self.query_one("#harness-status", Static).update(f"{self.harness}: imported {imported} model(s) • vault is source")
+            else:
+                self.query_one("#harness-status", Static).update(f"{self.harness}: nothing imported ({note or 'no working keys or base_url'}) • vault untouched")
+        except Exception as e:
+            self.query_one("#harness-status", Static).update(f"{self.harness}: import failed {e}")
         self.refresh_content()
 
     @on(Button.Pressed, "#pick")
@@ -2710,40 +2762,89 @@ class HarnessScreen(Screen):
             table = self.query_one("#harness-table", DataTable)
             row = table.cursor_row
             if row is None:
+                try:
+                    self.query_one("#harness-status", Static).update("Select a row first")
+                except Exception:
+                    pass
                 return
-            # Get provider/model from row
-            prov = table.get_cell_at((row, 0))
-            model = table.get_cell_at((row, 1))
+            prov = str(table.get_cell_at((row, 0))).strip()
+            model = str(table.get_cell_at((row, 1))).strip()
             # Remove from harness config only (vault untouched)
             if self.harness == "opencode":
                 import json as _json
                 with open(self.app.paths.opencode_json) as f:
                     cfg = _json.loads(engine._load_sync_module()._strip_jsonc(f.read()))
-                if isinstance(cfg.get("provider"), dict) and prov in cfg["provider"]:
-                    blk = cfg["provider"][prov]
-                    if isinstance(blk.get("models"), dict) and model in blk["models"]:
-                        del blk["models"][model]
-                    elif isinstance(blk.get("models"), list) and model in blk["models"]:
-                        blk["models"].remove(model)
-                    # atomic write
+                removed = False
+                for key in ("provider", "providers"):
+                    prov_map = cfg.get(key)
+                    if isinstance(prov_map, dict) and prov in prov_map:
+                        blk = prov_map[prov]
+                        if isinstance(blk.get("models"), dict) and model in blk["models"]:
+                            del blk["models"][model]
+                            removed = True
+                        elif isinstance(blk.get("models"), list) and model in blk["models"]:
+                            blk["models"].remove(model)
+                            removed = True
+                        # if provider now has no models, keep empty provider (user can delete later)
+                        if removed:
+                            break
+                if removed:
+                    import copy as _copy
+                    # backup before write (use engine helper)
                     engine._load_sync_module()._atomic_write_json(self.app.paths.opencode_json, cfg)
+                    try:
+                        self.query_one("#harness-status", Static).update(f"Removed {prov}/{model} from harness (vault untouched)")
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        self.query_one("#harness-status", Static).update(f"Not found: {prov}/{model}")
+                    except Exception:
+                        pass
             elif self.harness == "jcode":
-                # Remove from jcode config.toml
+                syncj = engine._load_jcode_module()
                 with open(self.app.paths.jcode_config) as f:
-                    txt = f.read()
-                # simple removal: remove that model line
-                lines = txt.splitlines()
-                out = []
-                skip = False
-                for line in lines:
-                    if f'"{model}"' in line and "id =" in line:
-                        # check if previous line is [[providers.<harness>.models]]
-                        # For now just skip this id line
-                        continue
-                    out.append(line)
-                open(self.app.paths.jcode_config, "w").write("\n".join(out))
-        except Exception:
-            pass
+                    text = f.read()
+                sections = syncj.split_sections(text)
+                # Find and remove the specific [[providers.<prov>.models]] where id == model
+                new_sections: list[tuple[str,list[str]]] = []
+                removed = False
+                for header, body in sections:
+                    if header.strip() == f"[[providers.{prov}.models]]":
+                        scal = syncj._toml_split_scalars(body)
+                        if scal.get("id") == model:
+                            removed = True
+                            continue
+                    new_sections.append((header, body))
+                if removed:
+                    pieces: list[str] = []
+                    for header, body in new_sections:
+                        if header:
+                            pieces.append(header)
+                        pieces.extend(body)
+                    new_text = "\n".join(pieces)
+                    err = syncj.verify_toml(new_text)
+                    if err is None:
+                        syncj._atomic_write_text(self.app.paths.jcode_config, new_text)
+                        try:
+                            self.query_one("#harness-status", Static).update(f"Removed {prov}/{model} from jcode (vault untouched)")
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            self.query_one("#harness-status", Static).update(f"Remove failed: {err}")
+                        except Exception:
+                            pass
+                else:
+                    try:
+                        self.query_one("#harness-status", Static).update(f"Not found: {prov}/{model}")
+                    except Exception:
+                        pass
+        except Exception as e:
+            try:
+                self.query_one("#harness-status", Static).update(f"Remove failed: {e}")
+            except Exception:
+                pass
         self.refresh_content()
 
     def action_back(self) -> None:
@@ -2755,7 +2856,9 @@ class HarnessScreen(Screen):
 
 
 class HarnessAddScreen(Screen):
-    """Add provider/model directly to harness (not vault)."""
+    """Add provider/model directly to harness (and vault — vault is the big DB)."""
+
+    BINDINGS = [("escape", "back", "Back")]  # noqa: RUF012
 
     def __init__(self, harness: str) -> None:
         super().__init__()
@@ -2764,13 +2867,18 @@ class HarnessAddScreen(Screen):
     def compose(self) -> ComposeResult:
         yield Header()
         with Vertical(id="body"):
-            yield Label(f"Add to {self.harness} (harness-only, vault untouched)", id="title")
+            yield Label(f"Add to {self.harness} + vault (vault is the big DB)", id="title")
             yield Input(placeholder="Provider (e.g. openai, anthropic, custom label)", id="add-provider")
             yield Input(placeholder="Model (e.g. gpt-4o, claude-sonnet)", id="add-model")
-            yield Input(placeholder="API key (optional, for this harness only)", id="add-key")
-            yield Button("Add", id="do-add", variant="primary")
-            yield Button("Back", id="back")
+            yield Input(placeholder="API key (optional, also saved to vault)", id="add-key")
+            yield Static("", id="add-status")
+            with Horizontal(id="add-actions"):
+                yield Button("Add", id="do-add", variant="primary")
+                yield Button("Back", id="back")
         yield Footer()
+
+    def action_back(self) -> None:
+        self.app.pop_screen()
 
     @on(Button.Pressed, "#do-add")
     def _do_add(self) -> None:
@@ -2778,44 +2886,108 @@ class HarnessAddScreen(Screen):
         model = self.query_one("#add-model", Input).value.strip()
         key = self.query_one("#add-key", Input).value.strip()
         if not prov or not model:
+            try:
+                self.query_one("#add-status", Static).update("Provider and model required")
+            except Exception:
+                pass
             return
         try:
-            # Vault is big database containing everything — also add to vault
-            vault_pid = prov.lower().replace(" ", "_")
+            # Vault is big database — also add to vault (so future imports include it)
+            vault_pid = prov.lower().replace(" ", "_").replace("-", "_")
+            vault_pid = "".join(c if c.isalnum() or c == "_" else "_" for c in vault_pid).strip("_") or "custom"
             if vault_pid not in self.app.db or not isinstance(self.app.db.get(vault_pid), dict):
                 self.app.db.setdefault(vault_pid, {"keys": [], "models": [], "endpoints": []})
             if model not in self.app.db[vault_pid].get("models", []):
                 self.app.db[vault_pid].setdefault("models", []).append(model)
-            if key and key not in self.app.db[vault_pid].get("keys", []):
-                # add to vault via engine (handles credentials)
+            if key:
+                # add to vault via engine (handles credentials dedup)
+                before_keys = set(self.app.db[vault_pid].get("keys", []))
                 engine.add_credentials(self.app.db, vault_pid, [key])
+                if set(self.app.db[vault_pid].get("keys", [])) != before_keys:
+                    engine.save_state(self.app.db, self.app.paths)
+                else:
+                    # model change alone still needs save
+                    engine.save_state(self.app.db, self.app.paths)
+            else:
                 engine.save_state(self.app.db, self.app.paths)
-            # Also add to harness (harness-only, vault untouched for delete, but add goes to both)
+            # Also add to harness (harness direct, vault is big DB)
             if self.harness == "opencode":
                 import json as _json
                 with open(self.app.paths.opencode_json) as f:
                     cfg = _json.loads(engine._load_sync_module()._strip_jsonc(f.read()))
-                cfg.setdefault("provider", {}).setdefault(prov, {}).setdefault("models", {})[model] = {"name": model}
+                container = cfg.setdefault("provider", {})
+                blk = container.setdefault(prov, {})
+                models = blk.get("models")
+                if isinstance(models, dict):
+                    models[model] = {"name": model}
+                elif isinstance(models, list):
+                    if model not in models:
+                        models.append(model)
+                else:
+                    blk["models"] = {model: {"name": model}}
                 if key:
-                    cfg["provider"][prov].setdefault("options", {})["apiKey"] = key
+                    blk.setdefault("options", {})["apiKey"] = key
                 engine._load_sync_module()._atomic_write_json(self.app.paths.opencode_json, cfg)
             elif self.harness == "jcode":
+                syncj = engine._load_jcode_module()
                 with open(self.app.paths.jcode_config) as f:
                     txt = f.read()
-                if f"[providers.{prov}]" not in txt:
-                    txt += f'\n[providers.{prov}]\ntype = "openai-compatible"\nbase_url = "https://api.openai.com/v1"\n'
+                # sanitize prov for TOML
+                import re as _re
+                safe_prov = _re.sub(r"[^A-Za-z0-9_.-]+", "-", prov.strip()).strip("-") or "provider"
+                profiles = syncj.parse_profiles(txt)
+                if safe_prov in profiles:
+                    existing = {m.get("id") for m in profiles[safe_prov].get("models", [])}
+                    if model not in existing:
+                        txt += f'\n[[providers.{safe_prov}.models]]\nid = "{model}"\n'
+                        err = syncj.verify_toml(txt)
+                        if err is None:
+                            syncj._atomic_write_text(self.app.paths.jcode_config, txt)
+                        else:
+                            try:
+                                self.query_one("#add-status", Static).update(f"Invalid TOML: {err}")
+                            except Exception:
+                                pass
+                            return
+                else:
+                    txt += f'\n[providers.{safe_prov}]\ntype = "openai-compatible"\nbase_url = "https://api.openai.com/v1"\n'
                     if key:
-                        txt += f'api_key_env = "HARNESS_{prov.upper()}_API_KEY"\n'
-                txt += f'\n[[providers.{prov}.models]]\nid = "{model}"\n'
-                open(self.app.paths.jcode_config, "w").write(txt)
-                if key:
-                    import os as _os
-                    env_path = os.path.join(os.path.expanduser("~"), ".config", "jcode", f"provider-{prov}.env")
-                    _os.makedirs(os.path.dirname(env_path), exist_ok=True)
-                    with open(env_path, "w") as ef:
-                        ef.write(f"HARNESS_{prov.upper()}_API_KEY={key}\n")
-        except Exception:
-            pass
+                        env_var = f"HARNESS_{_re.sub(r'[^A-Za-z0-9]+','_', safe_prov.upper()).strip('_')}_API_KEY"
+                        txt += f'api_key_env = "{env_var}"\n'
+                        txt += f'env_file = "provider-{safe_prov}.env"\n'
+                    txt += f'\n[[providers.{safe_prov}.models]]\nid = "{model}"\n'
+                    err = syncj.verify_toml(txt)
+                    if err is None:
+                        syncj._atomic_write_text(self.app.paths.jcode_config, txt)
+                        if key:
+                            import os as _os, tempfile as _tf
+                            env_var = f"HARNESS_{_re.sub(r'[^A-Za-z0-9]+','_', safe_prov.upper()).strip('_')}_API_KEY"
+                            env_path = os.path.join(os.path.expanduser("~"), ".config", "jcode", f"provider-{safe_prov}.env")
+                            _os.makedirs(os.path.dirname(env_path), exist_ok=True)
+                            try:
+                                fd, tmp = _tf.mkstemp(dir=os.path.dirname(env_path), prefix=".tmp-", suffix=".env")
+                                with os.fdopen(fd, "w") as ef:
+                                    ef.write(f"{env_var}={key}\n")
+                                os.chmod(tmp, 0o600)
+                                os.replace(tmp, env_path)
+                            except Exception:
+                                pass
+                    else:
+                        try:
+                            self.query_one("#add-status", Static).update(f"Invalid TOML: {err}")
+                        except Exception:
+                            pass
+                        return
+            try:
+                self.query_one("#add-status", Static).update(f"Added {prov}/{model} to vault + {self.harness}")
+            except Exception:
+                pass
+        except Exception as e:
+            try:
+                self.query_one("#add-status", Static).update(f"Add failed: {e}")
+            except Exception:
+                pass
+            return
         self.app.pop_screen()
 
     @on(Button.Pressed, "#back")
@@ -2837,26 +3009,40 @@ class VaultPickScreen(Screen):
         yield Header()
         with Vertical(id="body"):
             yield Label(f"Pick from Vault → {self.harness} (only working keys will be sent)", id="title")
-            yield Static("Space to select, Enter to confirm", id="pick-hint")
+            yield Static("Space to select, Enter to confirm • Esc/Back to cancel", id="pick-hint")
+            yield Static("", id="pick-status")
             yield SelectionList(id="vault-pick-list")
-            yield Button("Import selected", id="import-selected", variant="primary")
-            yield Button("Back", id="back")
+            with Horizontal(id="pick-actions"):
+                yield Button("Import selected", id="import-selected", variant="primary")
+                yield Button("Back", id="back")
         yield Footer()
 
     def on_mount(self) -> None:
         lst = self.query_one("#vault-pick-list", SelectionList)
-        # Show vault active rows only — working keys (active/throttled); empty handling
+        # Show vault active rows only — working keys (active/throttled); dedup by provider/model
+        seen: set[tuple[str,str]] = set()
         rows_added = 0
         for row in vault_table_rows(self.app.db, show_hidden=False):
             if row["health"] not in ("active", "throttled"):
                 continue
+            key = (row["provider"], row["pool"])
+            if key in seen:
+                continue
+            seen.add(key)
             rows_added += 1
-            pid, model = row["provider"], row["upstream"]
-            # Use display provider (label) but store pid for import
-            # For custom, pid is still custom_xxx, but display is label - need to map back
-            # For now use provider as displayed, but engine will handle label->pid via vault
-            key = f"{row['provider']} / {row['pool']} [{row['key']}]"
-            lst.add_option(Selection(key, (row["provider"], row["pool"])))
+            label = f"{row['provider']} / {row['pool']} [{row['key']}]"
+            lst.add_option(Selection(label, (row["provider"], row["pool"])))
+        # Empty handling: show hint when no working keys
+        try:
+            hint = self.query_one("#pick-status", Static)
+            if rows_added == 0:
+                hint.update("No working (active/throttled) models in vault — add keys and Probe first, or press 'a' in Vault to reveal hidden.")
+            else:
+                hint.update(f"{rows_added} working model(s) — Space to select, then Import selected")
+            # Focus list so Space/Enter work immediately, Esc still via binding
+            lst.focus()
+        except Exception:
+            pass
 
     @on(Button.Pressed, "#import-selected")
     def _import(self) -> None:
@@ -2880,9 +3066,12 @@ class VaultPickScreen(Screen):
         engine.harness_import_from_vault(self.app.paths, self.harness, resolved)
         self.app.pop_screen()
 
+    def action_back(self) -> None:
+        self.app.pop_screen()
+
     @on(Button.Pressed, "#back")
     def _back(self) -> None:
-        self.app.pop_screen()
+        self.action_back()
 
 
 class JCodeScreen(Screen):

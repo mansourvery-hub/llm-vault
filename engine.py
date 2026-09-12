@@ -663,16 +663,25 @@ def harness_delete(paths: EnginePaths | None = None, harness: str = "", keep_fre
         backup = f"{p.opencode_json}.bak-{stamp}"
         _sh.copy2(p.opencode_json, backup)
         if keep_free:
-            # Keep only zen (free) provider if present, wipe others
-            prov = cfg.get("provider") if isinstance(cfg.get("provider"), dict) else {}
-            zen = prov.get("opencode_zen") if isinstance(prov, dict) else None
-            new_prov = {}
+            # Keep only zen (free) provider if present, wipe others from both locations
+            zen = None
+            for key in ("provider", "providers"):
+                prov = cfg.get(key) if isinstance(cfg.get(key), dict) else {}
+                if isinstance(prov, dict) and "opencode_zen" in prov:
+                    zen = prov.get("opencode_zen")
+                    break
+            # Also check alternative naming "zen"
+            if zen is None:
+                for key in ("provider", "providers"):
+                    prov = cfg.get(key) if isinstance(cfg.get(key), dict) else {}
+                    if isinstance(prov, dict) and "zen" in prov:
+                        zen = prov.get("zen")
+                        break
+            cfg.pop("providers", None)
+            cfg.pop("provider", None)
             if isinstance(zen, dict):
-                new_prov["opencode_zen"] = zen
-            # keep only zen, wipe all other providers
-            cfg["provider"] = new_prov
-            if not new_prov:
-                cfg.pop("provider", None)
+                cfg["provider"] = {"opencode_zen": zen}
+            # providers stay cleared (zen kept under provider)
         else:
             # full delete: wipe file or provider section entirely (harness-only, never vault)
             # For opencode, delete the entire file's provider section or the file itself
@@ -781,16 +790,18 @@ def harness_import_from_vault(paths: EnginePaths | None = None, harness: str = "
             models = pdata.get("models") or []
             if not models:
                 continue
-            # Only import if this provider has working creds
             if not pdata.get("credentials"):
                 continue
-            # Get base_url and api key from vault
-            base = pdata.get("base_url") or (pdata.get("endpoints") or [None])[0]
-            # Use first working cred's secret
+            # Resolve provider type for base_url handling
+            _pinfo = _wiz._provider_info(filtered_db, pid) or {}
+            ptype = _pinfo.get("type", "api")
+            # api providers don't need a base_url (builtin), custom_api/ollama do
+            base = _wiz.effective_base_url(filtered_db, pid) or (pdata.get("endpoints") or [None])[0]
             secret = pdata["credentials"][0].get("secret") if pdata["credentials"] else None
-            if not base or not secret:
+            if not secret:
                 continue
-            # Check if selected filter applies
+            if ptype in ("custom_api", "remote_ollama", "local_ollama") and not base:
+                continue
             if selected is not None:
                 wanted = {m for (pp, m) in selected if pp == pid}
                 if wanted:
@@ -799,15 +810,15 @@ def harness_import_from_vault(paths: EnginePaths | None = None, harness: str = "
                         continue
                 elif not any(pp == pid for pp, _ in selected):
                     continue
-            # Create/update opencode provider block
-            # Use pid as provider name, or label if custom
             disp_pid = pdata.get("label") if (pid == "custom" or pid.startswith("custom_")) and pdata.get("label") else pid
-            # Avoid overwriting existing provider unless selected
             if disp_pid not in prov:
                 prov[disp_pid] = {}
             blk = prov[disp_pid]
-            # Set baseURL and apiKey
-            blk.setdefault("options", {})["baseURL"] = base
+            # Set baseURL only when we have one (api providers use builtin)
+            if base:
+                blk.setdefault("options", {})["baseURL"] = base
+            else:
+                blk.setdefault("options", {})
             blk["options"]["apiKey"] = secret
             # Merge models
             existing_models = blk.get("models") or {}
@@ -849,9 +860,26 @@ def harness_import_from_vault(paths: EnginePaths | None = None, harness: str = "
                 continue
             if not pdata.get("credentials"):
                 continue
-            base = pdata.get("base_url") or (pdata.get("endpoints") or [None])[0]
+            _pinfo2 = _wiz._provider_info(filtered_db, pid) or {}
+            ptype2 = _pinfo2.get("type", "api")
+            base = _wiz.effective_base_url(filtered_db, pid) or (pdata.get("endpoints") or [None])[0]
             secret = pdata["credentials"][0].get("secret") if pdata["credentials"] else None
-            if not base or not secret:
+            if not secret:
+                continue
+            # jcode is openai-compatible only; skip native api providers without a base (e.g. gemini direct)
+            # For those, they would be used via proxy, not direct harness import
+            if ptype2 in ("custom_api", "remote_ollama", "local_ollama") and not base:
+                continue
+            if ptype2 == "api" and not base and pid not in ("openai", "openrouter"):
+                # gemini/anthropic native not handled as openai-compatible in jcode; skip
+                # but allow openai/openrouter which are openai protocol
+                if pid not in _wiz.PROVIDER_META:
+                    continue
+                # for jcode we only import openai-compatible endpoints; skip pure gemini/anthropic
+                if pid in ("gemini", "anthropic"):
+                    continue
+            if not base:
+                # For jcode, base is required for openai-compatible block; skip if still none
                 continue
             if selected is not None:
                 wanted = {m for (pp, m) in selected if pp == pid}
@@ -1425,26 +1453,10 @@ def sha256_file(path: str) -> str:
     return h.hexdigest()
 
 
-def detect_harnesses(paths: EnginePaths | None = None) -> list[str]:
-    """Return harness ids with a config present (dynamic tabs)."""
-    p = _resolve_paths(paths)
-    out: list[str] = []
-    # opencode: json exists
-    if os.path.exists(p.opencode_json):
-        out.append("opencode")
-    # jcode: dir exists (even if config empty, harness is installed)
-    jdir = os.path.dirname(os.path.abspath(p.jcode_config))
-    if os.path.isdir(jdir) or os.path.exists(p.jcode_config):
-        # also check legacy ~/.jcode exists
-        if os.path.exists(os.path.expanduser("~/.jcode")) or os.path.exists(p.jcode_config):
-            out.append("jcode")
-    return out
-
-
 def vault_filter(db: dict[str, Any], show_hidden: bool = False) -> dict[str, Any]:
-    """Return vault view: by default only active+throttled, hidden otherwise."""
-    # Credentials with validation status invalid/expired/unknown are hidden unless show_hidden
-    hidden_statuses = {"invalid", "expired", "unknown"}
+    """Return vault view: by default active+throttled+unknown, hidden invalid/expired only."""
+    # Hidden are dead keys (invalid/expired) — unknown stays visible so new keys can be probed
+    hidden_statuses = {"invalid", "expired"}
     filtered: dict[str, Any] = {}
     for pid, pdata in db.items():
         if pid.startswith("_"):
@@ -1467,58 +1479,6 @@ def vault_filter(db: dict[str, Any], show_hidden: bool = False) -> dict[str, Any
         # keep pdata but with filtered creds for display; original DB untouched
         filtered[pid] = {**pdata, "credentials": visible, "keys": [x.get("secret","") for x in visible]}
     return filtered
-
-
-def harness_import_from_vault(paths: EnginePaths | None = None, harness: str = "", selected: list[tuple[str,str]] | None = None) -> dict[str, Any]:
-    """Import vault working keys into one harness (vault is source of truth).
-
-    If selected is None: import all working (ok/throttled). Else import only those (provider,model) pairs.
-    Only working keys are sent; dead keys never leave vault. One harness at a time, no harness→harness.
-    """
-    p = _resolve_paths(paths)
-    db = load_state(p)
-    # collect working credentials per provider
-    working_creds: dict[str, list[dict[str, Any]]] = {}
-    for pid, pdata in db.items():
-        if pid.startswith("_") or not isinstance(pdata, dict):
-            continue
-        for c in _wiz.iter_credentials(pdata):
-            st = (c.get("validation") or {}).get("status", "unknown")
-            if st in ("ok", "throttled"):
-                working_creds.setdefault(pid, []).append(c)
-    # filter by selected if given
-    # For now, harness sync is via sync modules: opencode uses gateway pools, jcode uses provider profile.
-    # We delegate to the harness's sync with a filtered DB view.
-    # Build a temp filtered DB that only has working creds for the requested harness.
-    filtered_db = json.loads(json.dumps(db))  # deep copy
-    for pid in list(filtered_db.keys()):
-        if pid.startswith("_"):
-            continue
-        if not isinstance(filtered_db[pid], dict):
-            continue
-        # keep only working creds
-        creds = [c for c in filtered_db[pid].get("credentials", []) if c.get("id") in {x.get("id") for x in working_creds.get(pid, [])}]
-        # if selected filter, further restrict by model
-        if selected is not None:
-            wanted_models = {m for (pp, m) in selected if pp == pid}
-            # keep only models that are wanted? For now keep all if selected is empty means all
-            if wanted_models:
-                filtered_db[pid]["models"] = [m for m in filtered_db[pid].get("models", []) if m in wanted_models]
-        filtered_db[pid]["credentials"] = creds
-        filtered_db[pid]["keys"] = [c.get("secret","") for c in creds]
-    # Now call harness sync with filtered_db
-    if harness == "opencode":
-        # use sync-opencode via engine
-        with _patched_wizard(p):
-            _wiz.save_db(filtered_db)  # save filtered view to temp? Instead, directly call sync with filtered_db's pools
-            # For minimal, we call the sync module directly with the filtered aliases
-            # The sync will read from the DB file, so we need to write filtered to a temp DB and point wizard there
-            pass
-        # For this minimal fork, we just return what would be imported
-        return {"harness": harness, "imported": sum(len(v) for v in working_creds.values()), "note": "vault → harness (working only)"}
-    if harness == "jcode":
-        return {"harness": harness, "imported": sum(len(v) for v in working_creds.values()), "note": "vault → harness (working only)"}
-    return {"harness": harness, "imported": 0, "note": "unknown harness"}
 
 
 def _atomic_write_json_tmp(path: str, data: dict[str, Any]) -> None:
