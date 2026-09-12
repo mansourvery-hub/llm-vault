@@ -6,7 +6,7 @@ credentials + model capabilities + quota domains + routing policy into
 LiteLLM YAML. LiteLLM remains the runtime router; this wizard is the
 control plane / configuration compiler.
 """
-__version__ = "3.0.0"
+__version__ = "3.5.0"
 SCHEMA_VERSION = 2
 import datetime
 import hashlib
