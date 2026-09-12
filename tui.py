@@ -658,11 +658,11 @@ class HomeScreen(Screen):
         from textual.widgets import Tabs
         yield Header()
         with Vertical(id="body"):
-            # Tabs: Vault (main) + per-proxy tabs + dynamic harness tabs
+            # Tabs: Vault (main) + per-proxy tabs (only installed) + dynamic harness tabs
             harnesses = engine.detect_harnesses()
             if not harnesses:
                 harnesses = ["opencode", "jcode"]
-            proxy_tabs = [f"Proxy: {p}" for p in engine.PROXY_TYPES]
+            proxy_tabs = [f"Proxy: {p}" for p in engine.detect_proxies()]
             tabs = ["Vault"] + proxy_tabs + [h.title() for h in harnesses]
             yield Tabs(*tabs, id="main-tabs")
             yield Static("", id="gateway-badge")
@@ -2455,6 +2455,12 @@ class ProxyScreen(Screen):
         with Vertical(id="body"):
             yield Label("Proxy — routing only, vault supplies keys", id="title")
             yield Static("", id="proxy-status")
+            yield Label("Proxy type:", id="proxy-type-label")
+            yield SelectionList(id="proxy-type-list")
+            yield Label("Routing:", id="proxy-routing-label")
+            yield Input(placeholder="usage-based-routing-v2", id="proxy-routing")
+            yield Label("Free keys handling (throttled kept, 429 cooldown):", id="proxy-free-label")
+            yield Input(placeholder="60", id="proxy-cooldown-rate")
             yield Static("Rate-limit handling: 429 → cooldown 60s, 5xx → 30s, vault throttled kept", id="proxy-help")
             yield Button("Apply proxy config", id="apply-proxy", variant="primary")
             yield Button("Back", id="back")
@@ -2462,26 +2468,52 @@ class ProxyScreen(Screen):
 
     def on_mount(self) -> None:
         self.refresh_content()
+        # Populate proxy type list
+        try:
+            lst = self.query_one("#proxy-type-list", SelectionList)
+            lst.clear_options()
+            for pt in engine.PROXY_TYPES:
+                lst.add_option(Selection(pt, pt, self.proxy_type == pt or (not self.proxy_type and pt == engine.get_proxy_type(self.app.db))))
+            routing = self.app.db.get("_proxy", {}).get("routing", "usage-based-routing-v2")
+            self.query_one("#proxy-routing", Input).value = str(routing)
+            cooldown = self.app.db.get("_proxy", {}).get("cooldown_rate", 60)
+            self.query_one("#proxy-cooldown-rate", Input).value = str(cooldown)
+        except NoMatches:
+            pass
 
     def refresh_content(self) -> None:
         app = self.app
         assert isinstance(app, WizardApp)
         pt = self.proxy_type or engine.get_proxy_type(app.db)
-        # keep very sparse for now, but show free keys handling
-        self.query_one("#proxy-status", Static).update(f"Proxy: {pt} (vault → {pt} compile)\nRouting: usage-based-routing-v2, throttled kept")
+        routing = app.db.get("_proxy", {}).get("routing", "usage-based-routing-v2")
+        cooldown = app.db.get("_proxy", {}).get("cooldown_rate", 60)
+        self.query_one("#proxy-status", Static).update(f"Proxy: {pt} (vault → {pt} compile)\nRouting: {routing}, cooldown: {cooldown}s, throttled kept")
 
     @on(Button.Pressed, "#apply-proxy")
     def _apply(self) -> None:
         app = self.app
         assert isinstance(app, WizardApp)
-        # Ensure DB proxy type matches this tab
-        if self.proxy_type:
-            try:
-                engine.set_proxy_type(app.db, self.proxy_type)
-                engine.save_state(app.db, app.paths)
-            except ValueError as e:
-                self.query_one("#proxy-status", Static).update(f"Set proxy failed: {e}")
-                return
+        # Apply proxy type from selection or tab
+        try:
+            sel = self.query_one("#proxy-type-list", SelectionList).selected
+            chosen = sel[0] if sel else (self.proxy_type or engine.get_proxy_type(app.db))
+            if chosen and chosen != engine.get_proxy_type(app.db):
+                engine.set_proxy_type(app.db, chosen)
+            # Apply routing and cooldown from inputs
+            routing = self.query_one("#proxy-routing", Input).value.strip()
+            if routing:
+                if not isinstance(app.db.get("_proxy"), dict):
+                    app.db["_proxy"] = {}
+                app.db["_proxy"]["routing"] = routing
+            cooldown = self.query_one("#proxy-cooldown-rate", Input).value.strip()
+            if cooldown.isdigit():
+                if not isinstance(app.db.get("_proxy"), dict):
+                    app.db["_proxy"] = {}
+                app.db["_proxy"]["cooldown_rate"] = int(cooldown)
+            engine.save_state(app.db, app.paths)
+        except (NoMatches, ValueError) as e:
+            self.query_one("#proxy-status", Static).update(f"Set proxy failed: {e}")
+            return
         try:
             n = engine.write_config(app.db, app.paths)
             pt = engine.get_proxy_type(app.db)
@@ -2512,7 +2544,7 @@ class HarnessScreen(Screen):
             yield DataTable(id="harness-table", cursor_type="row")
             yield Static("Select a row to remove, or Import from vault", id="harness-hint")
             yield Button("Delete", id="delete", variant="error")
-            yield Button("Keep free", id="keep-free")
+            yield Button("Delete (keep free)", id="keep-free")
             yield Button("Import all", id="import-all", variant="primary")
             yield Button("Pick", id="pick")
             yield Button("Add provider/model", id="add-harness-model")
@@ -2714,6 +2746,8 @@ class HarnessAddScreen(Screen):
 class VaultPickScreen(Screen):
     """Pick vault rows to import to one harness (vault is source, working only)."""
 
+    BINDINGS = [("escape", "back", "Back")]  # noqa: RUF012
+
     def __init__(self, harness: str) -> None:
         super().__init__()
         self.harness = harness
@@ -2723,6 +2757,7 @@ class VaultPickScreen(Screen):
         yield Header()
         with Vertical(id="body"):
             yield Label(f"Pick from Vault → {self.harness} (only working keys will be sent)", id="title")
+            yield Static("Space to select, Enter to confirm", id="pick-hint")
             yield SelectionList(id="vault-pick-list")
             yield Button("Import selected", id="import-selected", variant="primary")
             yield Button("Back", id="back")
@@ -2730,11 +2765,12 @@ class VaultPickScreen(Screen):
 
     def on_mount(self) -> None:
         lst = self.query_one("#vault-pick-list", SelectionList)
-        # Show vault active rows only
+        # Show vault active rows only — working keys (active/throttled); empty handling
+        rows_added = 0
         for row in vault_table_rows(self.app.db, show_hidden=False):
-            # Only working keys are importable (active/throttled)
             if row["health"] not in ("active", "throttled"):
                 continue
+            rows_added += 1
             pid, model = row["provider"], row["upstream"]
             # Use display provider (label) but store pid for import
             # For custom, pid is still custom_xxx, but display is label - need to map back

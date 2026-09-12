@@ -597,6 +597,33 @@ def set_proxy_type(db: dict[str, Any], proxy_type: str) -> None:
         db["_proxy"] = {}
     db["_proxy"]["type"] = proxy_type
 
+def detect_proxies(paths: EnginePaths | None = None) -> list[str]:
+    """Dynamic proxy tabs: only show installed proxies (litellm if config/venv/service exists, biofrost if binary/config exists)."""
+    p = _resolve_paths(paths)
+    out: list[str] = []
+    # litellm is installed if venv python exists or config.yaml exists or service file exists
+    litellm_installed = (
+        os.path.exists(os.path.expanduser("~/.config/litellm/venv/bin/python"))
+        or os.path.exists(p.yaml_file)
+        or os.path.exists(os.path.expanduser("~/.config/systemd/user/litellm.service"))
+        or os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)), "litellm.service"))
+    )
+    if litellm_installed:
+        out.append(ProxyType.LITELLM)
+    # biofrost is installed if binary exists or config exists
+    biofrost_installed = (
+        os.path.exists("/usr/local/bin/biofrost")
+        or os.path.exists(os.path.expanduser("~/.config/biofrost/config.json"))
+        or os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)), "biofrost.service"))
+        or os.path.exists(os.environ.get("BIOFROST_JSON", os.path.join(os.path.expanduser("~/.config/litellm"), "biofrost.json")))
+    )
+    if biofrost_installed:
+        out.append(ProxyType.BIOFROST)
+    # fallback: if nothing detected, show litellm (default) so UI not empty
+    if not out:
+        out.append(ProxyType.LITELLM)
+    return out
+
 # ---------------------------------------------------------------- harnesses ---
 
 def detect_harnesses(paths: EnginePaths | None = None) -> list[str]:
@@ -726,50 +753,152 @@ def harness_import_from_vault(paths: EnginePaths | None = None, harness: str = "
             elif selected is not None and not any(pp == pid for pp, _ in selected):
                 # this provider not in selected list → no models
                 filtered_db[pid]["models"] = []
-    # Now sync harness with filtered DB (write via temp DB file)
-    import tempfile as _tf
-    with _tf.NamedTemporaryFile(mode="w", delete=False, suffix=".json") as tf:
-        json.dump(filtered_db, tf)
-        tf_path = tf.name
-    # Use wizard's DB_FILE override to compile filtered
-    old_db = _wiz.DB_FILE
-    _wiz.DB_FILE = tf_path
-    try:
-        # compile filtered to get pools, then sync harness via its sync module using that pools
-        # For opencode/jcode, sync reads from config.yaml, not DB directly, so we need to generate a temp yaml
-        # Simplify: directly call harness sync with filtered DB's pools via a temp yaml
-        # For minimal, we will generate a temp config.yaml from filtered DB and then sync
-        import yaml as _yaml
-        from wizard import generate_yaml as _gen
-        # Generate temp yaml
-        with _tf.NamedTemporaryFile(mode="w", delete=False, suffix=".yaml") as yf:
-            yf_path = yf.name
-        old_yaml = _wiz.YAML_FILE
-        _wiz.YAML_FILE = yf_path
-        try:
-            _gen(filtered_db)
-            # Now sync harness using that temp yaml
-            if harness == "opencode":
-                # sync-opencode reads from yaml path via EnginePaths, so we need to patch paths
-                tmp_paths = EnginePaths(db_file=tf_path, yaml_file=yf_path, secret_file=p.secret_file, opencode_json=p.opencode_json, jcode_config=p.jcode_config)
-                res = sync_opencode(tmp_paths, dry_run=False)
-                return {"harness": harness, "imported": len(working_ids), "selected": len(selected) if selected is not None else None, "res": res}
-            if harness == "jcode":
-                tmp_paths = EnginePaths(db_file=tf_path, yaml_file=yf_path, secret_file=p.secret_file, opencode_json=p.opencode_json, jcode_config=p.jcode_config)
-                res = sync_jcode(tmp_paths, dry_run=False)
-                return {"harness": harness, "imported": len(working_ids), "selected": len(selected) if selected is not None else None, "res": res}
-        finally:
-            _wiz.YAML_FILE = old_yaml
+    # Direct harness import: write vault working providers/models directly to harness config (not via gateway)
+    # This is the user-requested behavior: each harness has its own providers, vault is source, only working keys
+    if harness == "opencode":
+        # Read opencode.json, backup, then merge vault providers
+        import json as _json
+        if not os.path.exists(p.opencode_json):
+            return {"harness": harness, "imported": 0, "note": "no opencode config"}
+        with open(p.opencode_json) as f:
             try:
-                os.unlink(yf_path)
-            except OSError:
+                cfg = _json.loads(_load_sync_module()._strip_jsonc(f.read()))
+            except Exception as e:
+                return {"harness": harness, "imported": 0, "note": f"malformed opencode.json: {e}"}
+        import shutil as _sh, datetime as _dt
+        stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup = f"{p.opencode_json}.bak-{stamp}"
+        _sh.copy2(p.opencode_json, backup)
+        prov = cfg.setdefault("provider", {})
+        imported = 0
+        for pid, pdata in filtered_db.items():
+            if pid.startswith("_") or not isinstance(pdata, dict):
+                continue
+            models = pdata.get("models") or []
+            if not models:
+                continue
+            # Only import if this provider has working creds
+            if not pdata.get("credentials"):
+                continue
+            # Get base_url and api key from vault
+            base = pdata.get("base_url") or (pdata.get("endpoints") or [None])[0]
+            # Use first working cred's secret
+            secret = pdata["credentials"][0].get("secret") if pdata["credentials"] else None
+            if not base or not secret:
+                continue
+            # Check if selected filter applies
+            if selected is not None:
+                wanted = {m for (pp, m) in selected if pp == pid}
+                if wanted:
+                    models = [m for m in models if m in wanted]
+                    if not models:
+                        continue
+                elif not any(pp == pid for pp, _ in selected):
+                    continue
+            # Create/update opencode provider block
+            # Use pid as provider name, or label if custom
+            disp_pid = pdata.get("label") if (pid == "custom" or pid.startswith("custom_")) and pdata.get("label") else pid
+            # Avoid overwriting existing provider unless selected
+            if disp_pid not in prov:
+                prov[disp_pid] = {}
+            blk = prov[disp_pid]
+            # Set baseURL and apiKey
+            blk.setdefault("options", {})["baseURL"] = base
+            blk["options"]["apiKey"] = secret
+            # Merge models
+            existing_models = blk.get("models") or {}
+            if isinstance(existing_models, list):
+                # Convert list to dict
+                existing_models = {m: {"name": m} for m in existing_models}
+                blk["models"] = existing_models
+            if not isinstance(blk.get("models"), dict):
+                blk["models"] = {}
+            for m in models:
+                if m not in blk["models"]:
+                    blk["models"][m] = {"name": m}
+                    imported += 1
+            # Handle custom label case where pid is custom but disp is label
+            # Ensure we don't leave stale custom entry
+        _load_sync_module()._atomic_write_json(p.opencode_json, cfg)
+        return {"harness": harness, "imported": imported, "selected": len(selected) if selected is not None else None, "backup": backup}
+    if harness == "jcode":
+        # For jcode, write directly to config.toml providers (not via managed profile)
+        syncj = _load_jcode_module()
+        if not os.path.exists(p.jcode_config):
+            # Create minimal config
+            with open(p.jcode_config, "w") as f:
+                f.write("[provider]\n")
+        with open(p.jcode_config) as f:
+            text = f.read()
+        import shutil as _sh, datetime as _dt
+        stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup = f"{p.jcode_config}.bak-{stamp}"
+        _sh.copy2(p.jcode_config, backup)
+        # Parse existing profiles to avoid duplicates
+        profiles = syncj.parse_profiles(text)
+        imported = 0
+        for pid, pdata in filtered_db.items():
+            if pid.startswith("_") or not isinstance(pdata, dict):
+                continue
+            models = pdata.get("models") or []
+            if not models:
+                continue
+            if not pdata.get("credentials"):
+                continue
+            base = pdata.get("base_url") or (pdata.get("endpoints") or [None])[0]
+            secret = pdata["credentials"][0].get("secret") if pdata["credentials"] else None
+            if not base or not secret:
+                continue
+            if selected is not None:
+                wanted = {m for (pp, m) in selected if pp == pid}
+                if wanted:
+                    models = [m for m in models if m in wanted]
+                    if not models:
+                        continue
+                elif not any(pp == pid for pp, _ in selected):
+                    continue
+            disp_pid = pdata.get("label") if (pid == "custom" or pid.startswith("custom_")) and pdata.get("label") else pid
+            # Sanitize for jcode (must be valid TOML key)
+            import re as _re
+            sanitized = _re.sub(r"[^A-Za-z0-9_.-]+", "-", disp_pid.strip().lower()).strip("-") or "provider"
+            if sanitized in profiles:
+                # Already exists, skip unless we want to merge models
+                existing_models = {m.get("id") for m in profiles[sanitized].get("models", [])}
+                new_models = [m for m in models if m not in existing_models]
+                if not new_models:
+                    continue
+                # Append new models to existing provider
+                for m in new_models:
+                    text += f'\n[[providers.{sanitized}.models]]\nid = "{m}"\n'
+                    imported += 1
+                continue
+            # Create new provider block
+            env_var = f"JCODE_PROVIDER_{_re.sub(r'[^A-Za-z0-9]+', '_', sanitized.upper()).strip('_')}_API_KEY"
+            env_file = f"provider-{sanitized}.env"
+            # Write env file
+            import os as _os, tempfile as _tf
+            jcode_config_dir = os.path.join(os.path.expanduser("~"), ".config", "jcode")
+            _os.makedirs(jcode_config_dir, exist_ok=True)
+            env_path = os.path.join(jcode_config_dir, env_file)
+            try:
+                fd, tmp = _tf.mkstemp(dir=jcode_config_dir, prefix=".tmp-", suffix=".env")
+                with os.fdopen(fd, "w") as ef:
+                    ef.write(f"{env_var}={secret}\n")
+                os.chmod(tmp, 0o600)
+                os.replace(tmp, env_path)
+            except Exception:
                 pass
-    finally:
-        _wiz.DB_FILE = old_db
-        try:
-            os.unlink(tf_path)
-        except OSError:
-            pass
+            text += f'\n[providers.{sanitized}]\ntype = "openai-compatible"\nbase_url = "{base}"\nauth = "bearer"\napi_key_env = "{env_var}"\nenv_file = "{env_file}"\nrequires_api_key = true\ndefault_model = "{models[0]}"\n'
+            for m in models:
+                text += f'\n[[providers.{sanitized}.models]]\nid = "{m}"\n'
+                imported += 1
+        # Verify and write
+        err = syncj.verify_toml(text)
+        if err:
+            _sh.copy2(backup, p.jcode_config)
+            return {"harness": harness, "imported": 0, "note": f"unparseable TOML: {err}", "backup": backup}
+        syncj._atomic_write_text(p.jcode_config, text)
+        return {"harness": harness, "imported": imported, "selected": len(selected) if selected is not None else None, "backup": backup}
     return {"harness": harness, "imported": 0, "note": "unknown harness"}
 
 
