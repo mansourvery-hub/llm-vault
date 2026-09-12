@@ -66,6 +66,7 @@ from textual.widgets import (
     ListView,
     SelectionList,
     Static,
+    Tabs,
     TextArea,
     Tree,
 )
@@ -197,8 +198,25 @@ def vault_table_rows(db: dict[str, Any], show_hidden: bool = False) -> list[dict
             mark, word = HEALTH_DISPLAY.get({"active": "healthy", "throttled": "throttled", "invalid": "invalid", "expired": "invalid"}.get(health, "unknown"), ("?", health))
             secret = cred.get("secret") or ""
             suffix = engine.mask_secret(secret) if secret else "…" + cred.get("id","")[-4:]
-            # never say "custom" — use label or provider name
-            disp_provider = pdata.get("label") if (pid == "custom" or pid.startswith("custom_")) and pdata.get("label") else pid
+            # never say "custom" — use label, or derive from endpoint host
+            if (pid == "custom" or pid.startswith("custom_")) and pdata.get("label"):
+                disp_provider = pdata["label"]
+            elif pid == "custom" or pid.startswith("custom_"):
+                # derive from endpoint host if no label
+                base = pdata.get("base_url") or (pdata.get("endpoints") or [""])[0]
+                if base:
+                    try:
+                        host = base.split("//")[-1].split("/")[0].split(".")[0]
+                        disp_provider = host.title() if host else pid
+                    except Exception:
+                        disp_provider = pid
+                else:
+                    disp_provider = pid
+                # fallback: if still custom, show as Custom Endpoint
+                if disp_provider == "custom":
+                    disp_provider = "Custom Endpoint"
+            else:
+                disp_provider = pid
             for model in (models or ["—"]):
                 lat = engine.probe_latency(db, pid, model) if model != "—" else None
                 rows.append({
@@ -244,9 +262,23 @@ def deployment_table_rows(db: dict[str, Any]) -> list[dict[str, Any]]:
                         key=lambda x: (str(x.get("provider") or ""),
                                        str(x.get("credential_id") or ""))):
             raw_provider = str(d.get("provider") or "")
-            # never say "custom" — show label if available
             pdata = db.get(raw_provider) if isinstance(db.get(raw_provider), dict) else {}
-            disp_provider = pdata.get("label") if (raw_provider == "custom" or raw_provider.startswith("custom_")) and pdata.get("label") else raw_provider
+            if (raw_provider == "custom" or raw_provider.startswith("custom_")) and pdata.get("label"):
+                disp_provider = pdata["label"]
+            elif raw_provider == "custom" or raw_provider.startswith("custom_"):
+                base = pdata.get("base_url") or (pdata.get("endpoints") or [""])[0]
+                if base:
+                    try:
+                        host = base.split("//")[-1].split("/")[0].split(".")[0]
+                        disp_provider = host.title() if host else raw_provider
+                    except Exception:
+                        disp_provider = raw_provider
+                else:
+                    disp_provider = raw_provider
+                if disp_provider == "custom":
+                    disp_provider = "Custom Endpoint"
+            else:
+                disp_provider = raw_provider
             provider = disp_provider
             upstream = str(d.get("upstream_model") or "")
             caps = d.get("capabilities") or {}
@@ -623,16 +655,16 @@ class HomeScreen(Screen):
         self._worker = None
 
     def compose(self) -> ComposeResult:
-        from textual.widgets import Tabs, Tab
+        from textual.widgets import Tabs
         yield Header()
         with Vertical(id="body"):
-            yield Label("Vault — active only (a to show hidden)", id="title")
-            # Tabs: Vault (main) + Proxy + dynamic harness tabs
-            with Tabs(id="main-tabs"):
-                yield Tab("Vault", id="tab-vault")
-                yield Tab(f"Proxy ({engine.get_proxy_type(self.app.db) if hasattr(self, 'app') and hasattr(self.app, 'db') else 'litellm'})", id="tab-proxy")
-                for h in engine.detect_harnesses():
-                    yield Tab(h.title(), id=f"tab-{h}")
+            # Tabs: Vault (main) + Proxy + dynamic harness tabs (opencode/jcode)
+            # Use simple string tabs to avoid id validation issues; handle activation via event
+            harnesses = engine.detect_harnesses()
+            if not harnesses:
+                harnesses = ["opencode", "jcode"]
+            tabs = ["Vault", "Proxy"] + [h.title() for h in harnesses]
+            yield Tabs(*tabs, id="main-tabs")
             yield Static("", id="gateway-badge")
             yield Static("", id="sync-targets")
             yield Input(placeholder="Filter vault provider/model/key ( / to focus, x to clear )",
@@ -658,6 +690,16 @@ class HomeScreen(Screen):
         # per credential (skipped when everything already reported).
         if app.auto_probe and any(r["health"] == "unknown" for r in self.rows):
             self.action_probe_all()
+    @on(Tabs.TabActivated)
+    def _tab_activated(self, event: Tabs.TabActivated) -> None:
+        label = event.tab.label.plain if hasattr(event.tab.label, "plain") else str(event.tab.label)
+        if label == "Vault":
+            return
+        if label == "Proxy":
+            self.app.push_screen(ProxyScreen())
+        elif label.lower() in ("opencode", "jcode"):
+            self.app.push_screen(HarnessScreen(label.lower()))
+
     def on_screen_resume(self) -> None:
         self.refresh_content()
         self._focus_table()
