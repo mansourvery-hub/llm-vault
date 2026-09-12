@@ -197,10 +197,12 @@ def vault_table_rows(db: dict[str, Any], show_hidden: bool = False) -> list[dict
             mark, word = HEALTH_DISPLAY.get({"active": "healthy", "throttled": "throttled", "invalid": "invalid", "expired": "invalid"}.get(health, "unknown"), ("?", health))
             secret = cred.get("secret") or ""
             suffix = engine.mask_secret(secret) if secret else "…" + cred.get("id","")[-4:]
+            # never say "custom" — use label or provider name
+            disp_provider = pdata.get("label") if (pid == "custom" or pid.startswith("custom_")) and pdata.get("label") else pid
             for model in (models or ["—"]):
                 lat = engine.probe_latency(db, pid, model) if model != "—" else None
                 rows.append({
-                    "pool": model, "provider": pid, "upstream": model,
+                    "pool": model, "provider": disp_provider, "upstream": model,
                     "tier": "unknown", "rpm": None, "tpm": None,
                     "quota_domain": cred.get("quota_domain",""),
                     "quota": _short_quota(cred.get("quota_domain","")),
@@ -241,7 +243,11 @@ def deployment_table_rows(db: dict[str, Any]) -> list[dict[str, Any]]:
         for d in sorted(pools[pool],
                         key=lambda x: (str(x.get("provider") or ""),
                                        str(x.get("credential_id") or ""))):
-            provider = str(d.get("provider") or "")
+            raw_provider = str(d.get("provider") or "")
+            # never say "custom" — show label if available
+            pdata = db.get(raw_provider) if isinstance(db.get(raw_provider), dict) else {}
+            disp_provider = pdata.get("label") if (raw_provider == "custom" or raw_provider.startswith("custom_")) and pdata.get("label") else raw_provider
+            provider = disp_provider
             upstream = str(d.get("upstream_model") or "")
             caps = d.get("capabilities") or {}
             tier = str(caps.get("tier") or "unknown")
@@ -617,9 +623,16 @@ class HomeScreen(Screen):
         self._worker = None
 
     def compose(self) -> ComposeResult:
+        from textual.widgets import Tabs, Tab
         yield Header()
         with Vertical(id="body"):
             yield Label("Vault — active only (a to show hidden)", id="title")
+            # Tabs: Vault (main) + Proxy + dynamic harness tabs
+            with Tabs(id="main-tabs"):
+                yield Tab("Vault", id="tab-vault")
+                yield Tab(f"Proxy ({engine.get_proxy_type(self.app.db) if hasattr(self, 'app') and hasattr(self.app, 'db') else 'litellm'})", id="tab-proxy")
+                for h in engine.detect_harnesses():
+                    yield Tab(h.title(), id=f"tab-{h}")
             yield Static("", id="gateway-badge")
             yield Static("", id="sync-targets")
             yield Input(placeholder="Filter vault provider/model/key ( / to focus, x to clear )",
@@ -631,13 +644,6 @@ class HomeScreen(Screen):
             yield Button("Add to Vault", id="go-configure", variant="primary")
             yield Button("Probe all", id="probe-all")
             yield Button("Cancel", id="cancel-probe")
-            yield Button("Proxy", id="go-proxy")
-            # Dynamic harness tabs (detected)
-            for h in engine.detect_harnesses():
-                yield Button(h.title(), id=f"go-{h}")
-            # Fallback static for compat/tests
-            if not engine.detect_harnesses():
-                yield Button("Harnesses", id="go-harness")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -2477,8 +2483,7 @@ class HarnessScreen(Screen):
 
     @on(Button.Pressed, "#pick")
     def _pick(self) -> None:
-        # For minimal, pick just opens vault with filter
-        self.app.push_screen(HomeScreen())
+        self.app.push_screen(VaultPickScreen(self.harness))
 
     def action_back(self) -> None:
         self.app.pop_screen()
@@ -2486,6 +2491,64 @@ class HarnessScreen(Screen):
     @on(Button.Pressed, "#back")
     def _back(self) -> None:
         self.action_back()
+
+
+class VaultPickScreen(Screen):
+    """Pick vault rows to import to one harness (vault is source, working only)."""
+
+    def __init__(self, harness: str) -> None:
+        super().__init__()
+        self.harness = harness
+        self.selected: set[tuple[str, str]] = set()
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with Vertical(id="body"):
+            yield Label(f"Pick from Vault → {self.harness} (only working keys will be sent)", id="title")
+            yield SelectionList(id="vault-pick-list")
+            yield Button("Import selected", id="import-selected", variant="primary")
+            yield Button("Back", id="back")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        lst = self.query_one("#vault-pick-list", SelectionList)
+        # Show vault active rows only
+        for row in vault_table_rows(self.app.db, show_hidden=False):
+            # Only working keys are importable (active/throttled)
+            if row["health"] not in ("active", "throttled"):
+                continue
+            pid, model = row["provider"], row["upstream"]
+            # Use display provider (label) but store pid for import
+            # For custom, pid is still custom_xxx, but display is label - need to map back
+            # For now use provider as displayed, but engine will handle label->pid via vault
+            key = f"{row['provider']} / {row['pool']} [{row['key']}]"
+            lst.add_option(Selection(key, (row["provider"], row["pool"])))
+
+    @on(Button.Pressed, "#import-selected")
+    def _import(self) -> None:
+        lst = self.query_one("#vault-pick-list", SelectionList)
+        selected = list(lst.selected)
+        if not selected:
+            return
+        # Map display provider back to pid if needed: try to resolve via engine
+        # For custom label, need to find pid
+        resolved = []
+        for prov_disp, model in selected:
+            # Try to find pid that matches display provider or label
+            pid = prov_disp
+            # Check if this is a label for custom
+            for cand in self.app.db:
+                if cand.startswith("custom") and isinstance(self.app.db[cand], dict):
+                    if self.app.db[cand].get("label") == prov_disp:
+                        pid = cand
+                        break
+            resolved.append((pid, model))
+        engine.harness_import_from_vault(self.app.paths, self.harness, resolved)
+        self.app.pop_screen()
+
+    @on(Button.Pressed, "#back")
+    def _back(self) -> None:
+        self.app.pop_screen()
 
 
 class JCodeScreen(Screen):
