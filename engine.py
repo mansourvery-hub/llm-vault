@@ -651,7 +651,6 @@ def harness_delete(paths: EnginePaths | None = None, harness: str = "", keep_fre
     p = _resolve_paths(paths)
     if harness == "opencode":
         sync = _load_sync_module()
-        # Read current, backup, then write minimal or empty
         if not os.path.exists(p.opencode_json):
             return {"deleted": False, "note": "no config"}
         with open(p.opencode_json) as f:
@@ -664,21 +663,26 @@ def harness_delete(paths: EnginePaths | None = None, harness: str = "", keep_fre
         backup = f"{p.opencode_json}.bak-{stamp}"
         _sh.copy2(p.opencode_json, backup)
         if keep_free:
-            # Keep only zen provider if present
+            # Keep only zen (free) provider if present, wipe others
             prov = cfg.get("provider") if isinstance(cfg.get("provider"), dict) else {}
             zen = prov.get("opencode_zen") if isinstance(prov, dict) else None
             new_prov = {}
             if isinstance(zen, dict):
                 new_prov["opencode_zen"] = zen
+            # keep only zen, wipe all other providers
             cfg["provider"] = new_prov
-            # also keep top-level zen if any
+            if not new_prov:
+                cfg.pop("provider", None)
         else:
-            # full delete: remove managed litellm block and provider
-            if isinstance(cfg.get("provider"), dict):
-                cfg["provider"].pop("litellm", None)
-                if not cfg["provider"]:
-                    cfg.pop("provider", None)
-        # atomic write
+            # full delete: wipe file or provider section entirely (harness-only, never vault)
+            # For opencode, delete the entire file's provider section or the file itself
+            if os.path.exists(p.opencode_json):
+                # For full delete, we can either remove the file or clear provider
+                # We choose to clear provider to keep file structure but empty
+                cfg.pop("provider", None)
+                cfg.pop("providers", None)
+                if not cfg:
+                    cfg = {"$schema": "https://opencode.ai/config.json"}
         sync._atomic_write_json(p.opencode_json, cfg)
         return {"deleted": True, "backup": backup, "keep_free": keep_free}
     if harness == "jcode":

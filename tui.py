@@ -52,7 +52,7 @@ except ImportError:
 from rich.text import Text
 from textual import on
 from textual.app import App, ComposeResult
-from textual.containers import Vertical
+from textual.containers import Horizontal, Vertical
 from textual.css.query import NoMatches
 from textual.screen import Screen
 from textual.widgets import (
@@ -673,9 +673,10 @@ class HomeScreen(Screen):
             yield Static("Vault: add API key + model • a: show hidden • /: filter • P: probe",
                          id="home-hint")
             yield Static("", id="home-attention")
-            yield Button("Add to Vault", id="go-configure", variant="primary")
-            yield Button("Probe all", id="probe-all")
-            yield Button("Cancel", id="cancel-probe")
+            with Horizontal(id="vault-actions"):
+                yield Button("Add to Vault", id="go-configure", variant="primary")
+                yield Button("Probe all", id="probe-all")
+                yield Button("Cancel", id="cancel-probe")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -705,6 +706,12 @@ class HomeScreen(Screen):
     def on_screen_resume(self) -> None:
         self.refresh_content()
         self._focus_table()
+        # Reset tabs so re-clicking harness works
+        try:
+            tabs = self.query_one("#main-tabs", Tabs)
+            tabs.active = "Vault"
+        except Exception:
+            pass
 
     # -- data --
 
@@ -1694,10 +1701,8 @@ class ModelScreen(Screen):
             self.last_status = "Select at least one model first."
             self._show_state()
             return
-        app = self.app
-        assert isinstance(app, WizardApp)
-        existing = engine.get_models(app.db, self.pid)
-        self.candidate = list(existing) + [m for m in picked if m not in existing]
+        # Only probe what you picked — vault already holds the rest
+        self.candidate = list(picked)
         self._start_probe()
 
     def _start_probe(self) -> None:
@@ -2594,24 +2599,29 @@ class ProxyScreen(Screen):
 class HarnessScreen(Screen):
     """Generic harness tab: mirrors app's provider/model list, allows add/remove without touching vault."""
 
+    BINDINGS = [("escape", "back", "Back"), ("c", "configure", "Configure")]  # keep global shortcuts
+
     def __init__(self, harness: str) -> None:
         super().__init__()
         self.harness = harness
 
     def compose(self) -> ComposeResult:
+        from textual.containers import Horizontal
         yield Header()
         with Vertical(id="body"):
             yield Label(f"{self.harness} — mirrors {self.harness} /connect or /model", id="title")
             yield Static("", id="harness-status")
             yield DataTable(id="harness-table", cursor_type="row")
             yield Static("Select a row to remove, or Import from vault", id="harness-hint")
-            yield Button("Delete", id="delete", variant="error")
-            yield Button("Delete (keep free)", id="keep-free")
-            yield Button("Import all", id="import-all", variant="primary")
-            yield Button("Pick", id="pick")
-            yield Button("Add provider/model", id="add-harness-model")
-            yield Button("Remove selected", id="remove-harness-model")
-            yield Button("Back", id="back")
+            with Horizontal(id="harness-actions"):
+                yield Button("Delete all", id="delete", variant="error")
+                yield Button("Delete (keep free)", id="keep-free")
+                yield Button("Import all", id="import-all", variant="primary")
+                yield Button("Add from vault", id="pick")
+            with Horizontal(id="harness-edit"):
+                yield Button("Add provider/model", id="add-harness-model")
+                yield Button("Remove selected", id="remove-harness-model")
+                yield Button("Back", id="back")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -2814,7 +2824,7 @@ class HarnessAddScreen(Screen):
 
 
 class VaultPickScreen(Screen):
-    """Pick vault rows to import to one harness (vault is source, working only)."""
+    """Pick vault rows to import to one harness (vault is source, working only) — now Add from vault."""
 
     BINDINGS = [("escape", "back", "Back")]  # noqa: RUF012
 
