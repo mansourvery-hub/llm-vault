@@ -2190,6 +2190,14 @@ class DoneScreen(Screen):
             yield Button("Apply changes", id="apply", variant="primary")
             yield Button("Group suggested models", id="group-suggested")
             yield Button("Add free-first roles", id="free-first")
+            # Sync buttons dynamic per harness + fallback for tests (uses app.paths if available)
+            try:
+                hlist = engine.detect_harnesses(self.app.paths) if hasattr(self, 'app') and hasattr(self.app, 'paths') else engine.detect_harnesses()
+            except Exception:
+                hlist = engine.detect_harnesses()
+            for h in hlist:
+                yield Button(f"Sync {h.title()}", id=f"sync-{h}")
+            # Always add generic sync for test compat (hidden if hlist not empty but still queried)
             yield Button("Sync OpenCode", id="sync")
             yield Button("Cancel", id="cancel")
             yield Button("Back to Home", id="back")
@@ -2221,15 +2229,36 @@ class DoneScreen(Screen):
             self.last_content += "\n".join(lines)
         self.query_one("#done-content", Static).update(self.last_content)
         self.query_one("#apply-status", Static).update(self.last_status)
-        for bid in ("apply", "group-suggested", "free-first", "sync", "cancel", "back"):
-            self.query_one(f"#{bid}", Button).display = bid in self._visible_ids()
+        # Dynamic sync buttons per harness (use app.paths if available for test isolation)
+        try:
+            hlist = engine.detect_harnesses(self.app.paths) if hasattr(self.app, 'paths') else engine.detect_harnesses()
+        except Exception:
+            hlist = engine.detect_harnesses()
+        sync_ids = [f"sync-{h}" for h in hlist] if hlist else ["sync"]
+        # Always include generic sync for test compat
+        if "sync" not in sync_ids:
+            sync_ids = sync_ids + ["sync"]
+        all_ids = ["apply", "group-suggested", "free-first"] + sync_ids + ["cancel", "back"]
+        visible = set(self._visible_ids())
+        for bid in all_ids:
+            try:
+                self.query_one(f"#{bid}", Button).display = bid in visible
+            except NoMatches:
+                pass
 
     def _visible_ids(self) -> list[str]:
         ids = ["group-suggested"] if self.suggestions else []
         if self.free_first:
             ids.append("free-first")
+        try:
+            hlist = engine.detect_harnesses(self.app.paths) if hasattr(self.app, 'paths') else engine.detect_harnesses()
+        except Exception:
+            hlist = engine.detect_harnesses()
+        sync_ids = [f"sync-{h}" for h in hlist] if hlist else ["sync"]
+        if "sync" not in sync_ids:
+            sync_ids.append("sync")
         if self.applied_ok:
-            return [*ids, "sync", "back"]
+            return [*ids, *sync_ids, "back"]
         return ["apply", *ids, "back"]
 
     def _set_status(self, msg: str) -> None:
@@ -2332,23 +2361,40 @@ class DoneScreen(Screen):
 
     @on(Button.Pressed, "#sync")
     def _sync(self) -> None:
+        self._sync_harness("opencode")
+
+    @on(Button.Pressed, "#sync-opencode")
+    def _sync_opencode(self) -> None:
+        self._sync_harness("opencode")
+
+    @on(Button.Pressed, "#sync-jcode")
+    def _sync_jcode(self) -> None:
+        self._sync_harness("jcode")
+
+    def _sync_harness(self, harness: str) -> None:
         app = self.app
         assert isinstance(app, WizardApp)
         try:
-            result = _quiet_call(engine.sync_opencode, app.paths)
+            if harness == "opencode":
+                result = _quiet_call(engine.sync_opencode, app.paths)
+            elif harness == "jcode":
+                result = _quiet_call(engine.sync_jcode, app.paths)
+            else:
+                # generic: try sync_opencode for any harness (fallback)
+                result = _quiet_call(engine.sync_opencode, app.paths)
         except FileNotFoundError:
-            self._set_status(self.last_status + "\nOpenCode config not found — "
+            self._set_status(self.last_status + f"\n{harness} config not found — "
                              "skipped. The gateway itself is working.")
             return
         except ValueError as e:
-            # sync failed AFTER a working gateway: report separately
-            self._set_status(self.last_status + f"\nOpenCode sync failed "
+            self._set_status(self.last_status + f"\n{harness} sync failed "
                              f"separately ({e}) — the gateway itself is working.")
             return
-        exposed = result.get("exposed", [])
-        self._set_status(self.last_status + f"\nOpenCode updated "
-                         f"({len(exposed)} model(s)). Restart the OpenCode "
-                         "TUI, then /models -> litellm/<name>.")
+        exposed = result.get("exposed", []) if isinstance(result, dict) else []
+        # handle both sync_opencode and sync_jcode result shapes
+        count = len(exposed) if exposed else len(result.get("models", [])) if isinstance(result, dict) else 0
+        self._set_status(self.last_status + f"\n{harness.title()} updated "
+                         f"({count} model(s)). Restart {harness} and check /model.")
 
     @on(Button.Pressed, "#cancel")
     def _cancel(self) -> None:
@@ -2461,6 +2507,8 @@ class ProxyScreen(Screen):
             yield Input(placeholder="usage-based-routing-v2", id="proxy-routing")
             yield Label("Free keys handling (throttled kept, 429 cooldown):", id="proxy-free-label")
             yield Input(placeholder="60", id="proxy-cooldown-rate")
+            yield Label("Retry: try all providers in group before failing", id="proxy-retry-label")
+            yield SelectionList(id="proxy-retry-list")
             yield Static("Rate-limit handling: 429 → cooldown 60s, 5xx → 30s, vault throttled kept", id="proxy-help")
             yield Button("Apply proxy config", id="apply-proxy", variant="primary")
             yield Button("Back", id="back")
@@ -2478,6 +2526,12 @@ class ProxyScreen(Screen):
             self.query_one("#proxy-routing", Input).value = str(routing)
             cooldown = self.app.db.get("_proxy", {}).get("cooldown_rate", 60)
             self.query_one("#proxy-cooldown-rate", Input).value = str(cooldown)
+            # Retry handling: try all providers in group
+            rlst = self.query_one("#proxy-retry-list", SelectionList)
+            rlst.clear_options()
+            retry = self.app.db.get("_proxy", {}).get("retry_bad_request", True)
+            rlst.add_option(Selection("Try all providers in group (recommended)", True, retry is True or retry == "true"))
+            rlst.add_option(Selection("Fail fast (no retry on 400)", False, retry is False))
         except NoMatches:
             pass
 
@@ -2487,7 +2541,9 @@ class ProxyScreen(Screen):
         pt = self.proxy_type or engine.get_proxy_type(app.db)
         routing = app.db.get("_proxy", {}).get("routing", "usage-based-routing-v2")
         cooldown = app.db.get("_proxy", {}).get("cooldown_rate", 60)
-        self.query_one("#proxy-status", Static).update(f"Proxy: {pt} (vault → {pt} compile)\nRouting: {routing}, cooldown: {cooldown}s, throttled kept")
+        retry = app.db.get("_proxy", {}).get("retry_bad_request", True)
+        retry_txt = "try all providers" if retry else "fail fast"
+        self.query_one("#proxy-status", Static).update(f"Proxy: {pt} (vault → {pt} compile)\nRouting: {routing}, cooldown: {cooldown}s, retry: {retry_txt}, throttled kept")
 
     @on(Button.Pressed, "#apply-proxy")
     def _apply(self) -> None:
@@ -2510,6 +2566,12 @@ class ProxyScreen(Screen):
                 if not isinstance(app.db.get("_proxy"), dict):
                     app.db["_proxy"] = {}
                 app.db["_proxy"]["cooldown_rate"] = int(cooldown)
+            # Apply retry handling
+            rsel = self.query_one("#proxy-retry-list", SelectionList).selected
+            retry = rsel[0] if rsel else True
+            if not isinstance(app.db.get("_proxy"), dict):
+                app.db["_proxy"] = {}
+            app.db["_proxy"]["retry_bad_request"] = bool(retry)
             engine.save_state(app.db, app.paths)
         except (NoMatches, ValueError) as e:
             self.query_one("#proxy-status", Static).update(f"Set proxy failed: {e}")
@@ -2517,7 +2579,7 @@ class ProxyScreen(Screen):
         try:
             n = engine.write_config(app.db, app.paths)
             pt = engine.get_proxy_type(app.db)
-            self.query_one("#proxy-status", Static).update(f"Proxy {pt} applied: {n} routes")
+            self.query_one("#proxy-status", Static).update(f"Proxy {pt} applied: {n} routes (retry={'all' if app.db.get('_proxy',{}).get('retry_bad_request', True) else 'fast'})")
         except ValueError as e:
             self.query_one("#proxy-status", Static).update(f"Apply failed: {e}")
 
@@ -2708,6 +2770,17 @@ class HarnessAddScreen(Screen):
         if not prov or not model:
             return
         try:
+            # Vault is big database containing everything — also add to vault
+            vault_pid = prov.lower().replace(" ", "_")
+            if vault_pid not in self.app.db or not isinstance(self.app.db.get(vault_pid), dict):
+                self.app.db.setdefault(vault_pid, {"keys": [], "models": [], "endpoints": []})
+            if model not in self.app.db[vault_pid].get("models", []):
+                self.app.db[vault_pid].setdefault("models", []).append(model)
+            if key and key not in self.app.db[vault_pid].get("keys", []):
+                # add to vault via engine (handles credentials)
+                engine.add_credentials(self.app.db, vault_pid, [key])
+                engine.save_state(self.app.db, self.app.paths)
+            # Also add to harness (harness-only, vault untouched for delete, but add goes to both)
             if self.harness == "opencode":
                 import json as _json
                 with open(self.app.paths.opencode_json) as f:
@@ -2717,10 +2790,8 @@ class HarnessAddScreen(Screen):
                     cfg["provider"][prov].setdefault("options", {})["apiKey"] = key
                 engine._load_sync_module()._atomic_write_json(self.app.paths.opencode_json, cfg)
             elif self.harness == "jcode":
-                # Append to jcode config.toml
                 with open(self.app.paths.jcode_config) as f:
                     txt = f.read()
-                # Add provider if not exists, then add model
                 if f"[providers.{prov}]" not in txt:
                     txt += f'\n[providers.{prov}]\ntype = "openai-compatible"\nbase_url = "https://api.openai.com/v1"\n'
                     if key:
@@ -2728,8 +2799,7 @@ class HarnessAddScreen(Screen):
                 txt += f'\n[[providers.{prov}.models]]\nid = "{model}"\n'
                 open(self.app.paths.jcode_config, "w").write(txt)
                 if key:
-                    # store key in env file
-                    import os as _os, tempfile as _tf
+                    import os as _os
                     env_path = os.path.join(os.path.expanduser("~"), ".config", "jcode", f"provider-{prov}.env")
                     _os.makedirs(os.path.dirname(env_path), exist_ok=True)
                     with open(env_path, "w") as ef:

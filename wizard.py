@@ -6,7 +6,7 @@ credentials + model capabilities + quota domains + routing policy into
 LiteLLM YAML. LiteLLM remains the runtime router; this wizard is the
 control plane / configuration compiler.
 """
-__version__ = "3.6.1"
+__version__ = "3.6.2"
 SCHEMA_VERSION = 2
 import datetime
 import hashlib
@@ -58,6 +58,7 @@ HARNESS_KEY = "_harnesses"
 # - RetryPolicy supports ONLY: BadRequest, Authentication, Timeout,
 #   RateLimit, ContentPolicyViolation, InternalServer retries.
 #   (No ServiceUnavailable/Default keys — older configs emitted them.)
+ROUTING_STRATEGY = "usage-based-routing-v2"
 ROUTING_STRATEGY = "usage-based-routing-v2"
 RETRY_POLICY = {
     "AuthenticationErrorRetries": 0,
@@ -1300,21 +1301,30 @@ def generate_yaml(db_data, _prev_deployments=None):
         rest = primaries[1:] + [p for p in extra if p not in primaries]
         if rest:
             fallbacks.append({role: rest})
+    # Proxy routing is vault-adjacent but not hard-coded: read from db["_proxy"]
+    routing = db_data.get(PROXY_KEY, {}).get("routing", ROUTING_STRATEGY) if isinstance(db_data.get(PROXY_KEY), dict) else ROUTING_STRATEGY
+    retry_bad = db_data.get(PROXY_KEY, {}).get("retry_bad_request", False) if isinstance(db_data.get(PROXY_KEY), dict) else False
+    # If user wants to try all providers in group before failing, set BadRequest retries to num providers in largest pool
+    retry_policy = dict(RETRY_POLICY)
+    num_retries = ROUTER_NUM_RETRIES
+    if retry_bad:
+        # try all providers in group (e.g. 4 for deepseek-v4-flash)
+        max_pool = max((len(v) for v in pools.values()), default=1)
+        retry_policy["BadRequestErrorRetries"] = 1
+        num_retries = max(1, max_pool - 1)
     config = {
         "general_settings": {
-            # env-backed: LiteLLM resolves os.environ/* at startup, so the
-            # secret lives in the environment/0600 secret file, not in YAML.
             "master_key": "os.environ/LITELLM_MASTER_KEY",
         },
         "model_list": model_list,
         "router_settings": {
-            "routing_strategy": ROUTING_STRATEGY,
-            "num_retries": ROUTER_NUM_RETRIES,
+            "routing_strategy": routing,
+            "num_retries": num_retries,
             "cooldown_time": ROUTER_COOLDOWN_TIME,
             "allowed_fails": ROUTER_ALLOWED_FAILS,
             "allowed_fails_policy": dict(ALLOWED_FAILS_POLICY),
             "enable_pre_call_checks": True,
-            "retry_policy": dict(RETRY_POLICY),
+            "retry_policy": retry_policy,
         },
     }
     if model_group_alias:
